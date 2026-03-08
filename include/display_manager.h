@@ -1,7 +1,8 @@
 #pragma once
 
 #include <Arduino.h>
-#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h> // HUB75 DMA driver for ESP32-S3
+#include <NimBLEDevice.h>                 // NimBLE BLE stack (much lighter than built-in BLE library)
 #include "config.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
