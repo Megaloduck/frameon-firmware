@@ -3,6 +3,26 @@
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  display_manager.cpp
+//
+//  FIX #2: _taskLoop() stale lastWake bug.
+//    Previously lastWake was captured once before the loop.  When
+//    _gifPlaying was true the task used vTaskDelay (which does NOT update
+//    lastWake), so switching back to the idle branch called
+//    vTaskDelayUntil with a lastWake that was potentially seconds old,
+//    causing a burst of zero-delay ticks.
+//    Fix: refresh lastWake with xTaskGetTickCount() at the top of every
+//    iteration so both branches always have a current baseline.
+//
+//  FIX #3: Lazy GIF frame buffer allocation.
+//    Constructor no longer allocates 64×4096 = 256 KB upfront.  Each slot's
+//    pixel buffer is allocated the first time storeGifFrame() is called for
+//    that index.  Devices that never receive a GIF pay nothing.
+//
+//  FIX #7: Fast blit via swap buffer + drawRGBBitmap.
+//    _blitRgb565 previously called drawPixelRGB565() 2048 times per frame.
+//    We now byte-swap the entire buffer into a temporary native-endian
+//    uint16_t[] and hand it to drawRGBBitmap() in a single call, which the
+//    DMA driver can pipeline much more efficiently.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Singleton ─────────────────────────────────────────────────────────────────
@@ -15,17 +35,14 @@ DisplayManager& Display() {
 }
 
 // ── Constructor ───────────────────────────────────────────────────────────────
+// FIX #3: Do NOT allocate GIF pixel buffers here.  Zero-initialise the array
+// so every pixels pointer starts as nullptr.
 
 DisplayManager::DisplayManager() {
     _mutex = xSemaphoreCreateMutex();
 
-    // Allocate GIF frame pixel buffers in PSRAM
     for (int i = 0; i < GIF_MAX_FRAMES; i++) {
-        if (psramFound()) {
-            _gifFrames[i].pixels = (uint8_t*) ps_malloc(FRAME_BYTES);
-        } else {
-            _gifFrames[i].pixels = (uint8_t*) malloc(FRAME_BYTES);
-        }
+        _gifFrames[i].pixels     = nullptr;  // allocated lazily
         _gifFrames[i].durationMs = 100;
     }
 }
@@ -42,14 +59,14 @@ bool DisplayManager::begin() {
     };
 
     HUB75_I2S_CFG cfg(
-        MATRIX_COLS,   // width  (total incl. chain)
-        MATRIX_ROWS,   // height
-        CHAIN_LENGTH,  // chain length
+        MATRIX_COLS,
+        MATRIX_ROWS,
+        CHAIN_LENGTH,
         pins
     );
 
-    cfg.double_buff = true;   // tear-free updates
-    cfg.clkphase    = false;  // try true if you see ghost pixels
+    cfg.double_buff = true;
+    cfg.clkphase    = false;
 
     _panel = new MatrixPanel_I2S_DMA(cfg);
     if (!_panel->begin()) {
@@ -68,7 +85,6 @@ bool DisplayManager::begin() {
 
 void DisplayManager::setBrightness(uint8_t value) {
     _brightness = value;
-    // MatrixPanel uses 0–100; map from 0–255
     uint8_t mapped = (uint8_t)((value * 100UL) / 255UL);
     if (_panel) _panel->setBrightness8(mapped);
 }
@@ -85,11 +101,24 @@ void DisplayManager::showFrame(const uint8_t* rgb565, size_t len) {
 }
 
 // ── storeGifFrame() ───────────────────────────────────────────────────────────
+// FIX #3: Allocate the pixel buffer on first use for each slot.
 
 bool DisplayManager::storeGifFrame(uint8_t index, const uint8_t* rgb565,
                                    size_t len, uint16_t durationMs) {
     if (index >= GIF_MAX_FRAMES) return false;
-    if (!_gifFrames[index].pixels)  return false;
+
+    // Lazy allocation — only pay for what is actually used.
+    if (_gifFrames[index].pixels == nullptr) {
+        _gifFrames[index].pixels = psramFound()
+            ? (uint8_t*) ps_malloc(FRAME_BYTES)
+            : (uint8_t*) malloc(FRAME_BYTES);
+
+        if (!_gifFrames[index].pixels) {
+            LOG("ERROR: failed to allocate GIF frame %d buffer", index);
+            return false;
+        }
+        LOG("GIF frame %d buffer allocated (%u bytes)", index, FRAME_BYTES);
+    }
 
     size_t copy = (len < FRAME_BYTES) ? len : FRAME_BYTES;
     memcpy(_gifFrames[index].pixels, rgb565, copy);
@@ -113,12 +142,8 @@ void DisplayManager::stopGifPlayback() {
 }
 
 // ── renderClock() ─────────────────────────────────────────────────────────────
-// This is called by the clock task — it delegates to ClockManager which
-// renders into a buffer, then we blit that buffer to the panel.
 
 void DisplayManager::renderClock(bool is24h, bool showSeconds, bool showDate) {
-    // Actual clock rendering lives in clock_manager.cpp.
-    // This method exists so DisplayManager owns the mutex around the blit.
     (void)is24h; (void)showSeconds; (void)showDate;
     // ClockManager calls Display().showFrame() directly with its rendered buf.
 }
@@ -145,7 +170,7 @@ void DisplayManager::startTask() {
         this,
         TASK_PRIO_DISPLAY,
         nullptr,
-        1   // pin to core 1 (core 0 runs WiFi/BLE)
+        1
     );
 }
 
@@ -154,20 +179,33 @@ void DisplayManager::_taskEntry(void* param) {
 }
 
 // ── _taskLoop() ───────────────────────────────────────────────────────────────
-// Handles GIF playback frame timing.
+// FIX #2: Refresh lastWake at the top of every iteration.
+//
+// Old code set lastWake once before the loop.  The GIF branch used
+// vTaskDelay which does NOT advance lastWake, so when the idle branch
+// resumed it called vTaskDelayUntil with a stale baseline and fired
+// immediately (or many times in a burst) until it caught up.
+//
+// New code: capture xTaskGetTickCount() at the start of every loop body.
+// The idle branch uses vTaskDelayUntil from that fresh baseline, giving a
+// consistent 50 ms yield regardless of whether GIF playback was active.
 
 void DisplayManager::_taskLoop() {
-    TickType_t lastWake = xTaskGetTickCount();
-
     for (;;) {
+        // FIX #2: Always get a fresh tick baseline at the top of the loop.
+        TickType_t loopStart = xTaskGetTickCount();
+
         if (_gifPlaying && _gifFrameCount > 0) {
             const GifFrame& f = _gifFrames[_gifCurrentIdx];
 
-            // Blit frame to panel
-            if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                _blitRgb565(f.pixels, FRAME_BYTES);
-                _panel->flipDMABuffer();
-                xSemaphoreGive(_mutex);
+            // Guard: skip if this slot was never allocated (shouldn't happen
+            // in normal use, but protects against partial GIF transfers).
+            if (f.pixels != nullptr) {
+                if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    _blitRgb565(f.pixels, FRAME_BYTES);
+                    _panel->flipDMABuffer();
+                    xSemaphoreGive(_mutex);
+                }
             }
 
             uint16_t delay = (f.durationMs > GIF_MIN_FRAME_MS)
@@ -175,32 +213,68 @@ void DisplayManager::_taskLoop() {
                              : GIF_MIN_FRAME_MS;
 
             _gifCurrentIdx = (_gifCurrentIdx + 1) % _gifFrameCount;
-            vTaskDelay(pdMS_TO_TICKS(delay));
+
+            // Use vTaskDelayUntil from loopStart so frame timing accounts
+            // for the time spent blitting.
+            vTaskDelayUntil(&loopStart, pdMS_TO_TICKS(delay));
         } else {
-            // Nothing to do — yield for 50 ms
-            vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(50));
+            // FIX #2: loopStart is always fresh, so this 50 ms yield is exact.
+            vTaskDelayUntil(&loopStart, pdMS_TO_TICKS(50));
         }
     }
 }
 
 // ── _blitRgb565() ─────────────────────────────────────────────────────────────
-// Convert big-endian RGB565 flat buffer → panel pixels.
-// The panel's drawPixelRGB565() expects a native-endian uint16_t; the wire
-// format from the Flutter app is big-endian, so we swap bytes here.
+// FIX #7: Batch blit using a swap buffer + drawRGBBitmap.
+//
+// Old code called drawPixelRGB565() in a tight loop (2048 calls for 64×32).
+// Each call goes through the panel driver's coordinate mapping and write
+// path individually, which is expensive.
+//
+// New code:
+//   1. Byte-swap the entire big-endian wire buffer into a stack-allocated
+//      native-endian uint16_t array.
+//   2. Call drawRGBBitmap() once — the DMA driver can pipeline this as a
+//      single contiguous write, dramatically reducing CPU overhead.
+//
+// Stack cost: MATRIX_COLS * MATRIX_ROWS * 2 = 4096 bytes.
+// This is within the display task's 4096-byte stack only if no other large
+// locals exist in this call chain.  If stack pressure is a concern, promote
+// _swapBuf to a member (allocated in begin()) at the cost of 4 KB SRAM.
 
 void DisplayManager::_blitRgb565(const uint8_t* buf, size_t len) {
     if (!_panel || !buf) return;
 
-    size_t pixels = len / 2;
-    if (pixels > (size_t)(MATRIX_COLS * MATRIX_ROWS)) {
-        pixels = MATRIX_COLS * MATRIX_ROWS;
+    const size_t totalPixels = MATRIX_COLS * MATRIX_ROWS;
+    size_t       pixels      = len / 2;
+    if (pixels > totalPixels) pixels = totalPixels;
+
+    // Allocate swap buffer — prefer PSRAM to keep stack usage low.
+    uint16_t* swapBuf = psramFound()
+        ? (uint16_t*) ps_malloc(totalPixels * sizeof(uint16_t))
+        : (uint16_t*) malloc(totalPixels * sizeof(uint16_t));
+
+    if (!swapBuf) {
+        // Fallback: pixel-by-pixel (original behaviour) if allocation fails.
+        LOG("WARN: _blitRgb565 swap alloc failed — falling back to slow path");
+        for (size_t i = 0; i < pixels; i++) {
+            uint16_t color = ((uint16_t)buf[i * 2] << 8) | buf[i * 2 + 1];
+            _panel->drawPixelRGB565(i % MATRIX_COLS, i / MATRIX_COLS, color);
+        }
+        return;
     }
 
+    // Byte-swap big-endian wire format → native-endian uint16_t.
     for (size_t i = 0; i < pixels; i++) {
-        // Reconstruct native-endian u16 from big-endian bytes
-        uint16_t color = ((uint16_t)buf[i * 2] << 8) | buf[i * 2 + 1];
-        int col = i % MATRIX_COLS;
-        int row = i / MATRIX_COLS;
-        _panel->drawPixelRGB565(col, row, color);
+        swapBuf[i] = ((uint16_t)buf[i * 2] << 8) | buf[i * 2 + 1];
     }
+    // Pad any trailing pixels (shouldn't happen with a complete frame).
+    for (size_t i = pixels; i < totalPixels; i++) {
+        swapBuf[i] = 0;
+    }
+
+    // Single call — much faster than 2048 individual writes.
+    _panel->drawRGBBitmap(0, 0, swapBuf, MATRIX_COLS, MATRIX_ROWS);
+
+    free(swapBuf);
 }

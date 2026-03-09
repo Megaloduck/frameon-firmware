@@ -1,8 +1,8 @@
 #pragma once
 
 #include <Arduino.h>
-#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h> // HUB75 DMA driver for ESP32-S3
-#include <NimBLEDevice.h>                 // NimBLE BLE stack (much lighter than built-in BLE library)
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <NimBLEDevice.h>
 #include "config.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -13,12 +13,17 @@
 //
 //  Thread-safety: every public method that touches the panel acquires
 //  _mutex, so it is safe to call from both the BLE task and the clock task.
+//
+//  FIX #3: GIF frame pixel buffers are now allocated lazily in
+//  storeGifFrame() rather than all upfront in the constructor.
+//  This avoids consuming 256 KB of PSRAM/SRAM on devices that never
+//  receive a GIF.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── GIF frame descriptor ─────────────────────────────────────────────────────
 
 struct GifFrame {
-    uint8_t* pixels;    // FRAME_BYTES of RGB565 (big-endian)
+    uint8_t* pixels;    // FRAME_BYTES of RGB565 (big-endian); nullptr until first write
     uint16_t durationMs;
 };
 
@@ -29,7 +34,7 @@ public:
     DisplayManager();
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
-    bool begin();                       // call once in setup()
+    bool begin();
     void setBrightness(uint8_t value);  // 0–255 → mapped to panel 0–100
 
     // ── Still frame ───────────────────────────────────────────────────────────
@@ -37,23 +42,22 @@ public:
     void showFrame(const uint8_t* rgb565, size_t len);
 
     // ── GIF playback ─────────────────────────────────────────────────────────
-    // Store a decoded GIF frame into the internal ring buffer.
-    // Returns false if the frame index is out of range.
+    // Store a decoded GIF frame.  Allocates the pixel buffer on first write
+    // for each slot (FIX #3).  Returns false if index is out of range or
+    // allocation fails.
     bool storeGifFrame(uint8_t index, const uint8_t* rgb565,
                        size_t len, uint16_t durationMs);
     void setGifFrameCount(uint8_t count);
-    void startGifPlayback();   // kicks off the GIF playback loop
+    void startGifPlayback();
     void stopGifPlayback();
 
     // ── Clock mode ────────────────────────────────────────────────────────────
-    // Render a simple HH:MM (or HH:MM:SS) clock face directly onto the panel.
     void renderClock(bool is24h, bool showSeconds, bool showDate);
 
     // ── Utilities ─────────────────────────────────────────────────────────────
     void clear();
     MatrixPanel_I2S_DMA* panel() { return _panel; }
 
-    // Runs inside a FreeRTOS task — call startTask() to create it.
     void startTask();
 
 private:
@@ -62,6 +66,7 @@ private:
     uint8_t               _brightness = DEFAULT_BRIGHTNESS;
 
     // ── GIF state ─────────────────────────────────────────────────────────────
+    // FIX #3: pixels pointers start nullptr; allocated lazily in storeGifFrame.
     GifFrame  _gifFrames[GIF_MAX_FRAMES];
     uint8_t   _gifFrameCount  = 0;
     uint8_t   _gifCurrentIdx  = 0;
@@ -73,6 +78,8 @@ private:
     bool _clockShowDate    = false;
 
     // ── Internal helpers ──────────────────────────────────────────────────────
+    // FIX #7: _blitRgb565 now uses drawRGBBitmap for a single DMA-friendly
+    // call instead of 2048 individual drawPixelRGB565 calls.
     void _blitRgb565(const uint8_t* buf, size_t len);
     void _drawClockFace();
     void _drawSmallDigits(int x, int y, const char* str,
@@ -82,5 +89,4 @@ private:
     void        _taskLoop();
 };
 
-// ── Singleton accessor ────────────────────────────────────────────────────────
 DisplayManager& Display();

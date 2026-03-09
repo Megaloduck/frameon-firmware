@@ -6,9 +6,21 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  clock_manager.cpp
 //
-//  Clock face renders directly into a FRAME_BYTES RGB565 buffer which is
-//  then handed to Display().showFrame().  No external RTC chip needed —
-//  the ESP32 keeps time via gettimeofday() after sync from the phone.
+//  FIX #1 & #5: Task lifecycle now uses a FreeRTOS EventGroup instead of a
+//  volatile bool + fixed-delay poll.
+//
+//    stopTask():
+//      • Sets CLOCK_BIT_STOP  → task sees it on next wakeup
+//      • Waits on CLOCK_BIT_STOPPED (with generous timeout) → returns only
+//        after the task has called vTaskDelete(nullptr)
+//      • No arbitrary 550 ms sleep on the caller; typical latency is
+//        whatever fraction of CLOCK_REFRESH_MS remains on the task timer.
+//
+//    _taskLoop():
+//      • Replaces vTaskDelay with xEventGroupWaitBits so it can be
+//        interrupted mid-sleep by the stop signal.
+//      • Sets CLOCK_BIT_STOPPED before self-deleting so stopTask() unblocks
+//        immediately and never touches a dangling handle.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Singleton ─────────────────────────────────────────────────────────────────
@@ -57,7 +69,11 @@ int ClockManager::_charIndex(char c) {
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
-ClockManager::ClockManager() {}
+ClockManager::ClockManager() {
+    // FIX #1 / #5: Create the event group once at construction.
+    _eventGroup = xEventGroupCreate();
+    configASSERT(_eventGroup);
+}
 
 // ── syncTime() ───────────────────────────────────────────────────────────────
 
@@ -73,11 +89,14 @@ void ClockManager::syncTime(const Config& cfg) {
     LOG("System time set to epoch %lu", (unsigned long)cfg.epochUtc);
 }
 
-// ── startTask() / stopTask() ──────────────────────────────────────────────────
+// ── startTask() ──────────────────────────────────────────────────────────────
 
 void ClockManager::startTask() {
     if (_taskHandle) return; // already running
-    _stop = false;
+
+    // Clear both bits before spawning so the task starts clean.
+    xEventGroupClearBits(_eventGroup, CLOCK_BIT_STOP | CLOCK_BIT_STOPPED);
+
     xTaskCreatePinnedToCore(
         _taskEntry,
         "clock_task",
@@ -90,42 +109,83 @@ void ClockManager::startTask() {
     LOG("Clock task started");
 }
 
+// ── stopTask() ───────────────────────────────────────────────────────────────
+// FIX #1 / #5: Signal the task to stop and block until it confirms exit.
+// Typical wait time ≈ remaining slice of CLOCK_REFRESH_MS (≤ 500 ms).
+// The BLE stack is NOT stalled by an arbitrary fixed delay any more.
+
 void ClockManager::stopTask() {
     if (!_taskHandle) return;
-    _stop = true;
-    // Give the task time to notice and self-terminate
-    vTaskDelay(pdMS_TO_TICKS(CLOCK_REFRESH_MS + 50));
+
+    // Tell the task to exit.
+    xEventGroupSetBits(_eventGroup, CLOCK_BIT_STOP);
+
+    // Wait until the task sets CLOCK_BIT_STOPPED (timeout: 2 s safety net).
+    EventBits_t bits = xEventGroupWaitBits(
+        _eventGroup,
+        CLOCK_BIT_STOPPED,
+        pdFALSE,   // don't clear on exit
+        pdFALSE,
+        pdMS_TO_TICKS(2000)
+    );
+
+    if (!(bits & CLOCK_BIT_STOPPED)) {
+        // Timeout — task didn't respond; force-kill to avoid dangling handle.
+        LOG("WARN: clock task did not stop in time — force deleting");
+        vTaskDelete(_taskHandle);
+    }
+
     _taskHandle = nullptr;
+    xEventGroupClearBits(_eventGroup, CLOCK_BIT_STOP | CLOCK_BIT_STOPPED);
     LOG("Clock task stopped");
 }
+
+// ── Task entry / loop ─────────────────────────────────────────────────────────
 
 void ClockManager::_taskEntry(void* param) {
     static_cast<ClockManager*>(param)->_taskLoop();
 }
 
-// ── _taskLoop() ───────────────────────────────────────────────────────────────
-
 void ClockManager::_taskLoop() {
-    // Allocate render buffer (PSRAM preferred)
+    // Allocate render buffer (PSRAM preferred).
     uint8_t* buf = psramFound()
         ? (uint8_t*) ps_malloc(FRAME_BYTES)
         : (uint8_t*) malloc(FRAME_BYTES);
 
     if (!buf) {
         LOG("Clock task: failed to allocate render buffer");
+        // Signal stopped so stopTask() doesn't hang.
+        xEventGroupSetBits(_eventGroup, CLOCK_BIT_STOPPED);
         _taskHandle = nullptr;
         vTaskDelete(nullptr);
         return;
     }
 
-    while (!_stop) {
+    for (;;) {
+        // FIX #1: Use xEventGroupWaitBits as our sleep so that stopTask()
+        // can interrupt us mid-delay rather than us polling a volatile flag
+        // once per full CLOCK_REFRESH_MS cycle.
+        EventBits_t bits = xEventGroupWaitBits(
+            _eventGroup,
+            CLOCK_BIT_STOP,
+            pdFALSE,    // don't clear on exit
+            pdFALSE,
+            pdMS_TO_TICKS(CLOCK_REFRESH_MS)
+        );
+
+        if (bits & CLOCK_BIT_STOP) {
+            break; // clean exit requested
+        }
+
         renderToBuffer(buf);
         Display().showFrame(buf, FRAME_BYTES);
-        vTaskDelay(pdMS_TO_TICKS(CLOCK_REFRESH_MS));
     }
 
     free(buf);
-    _taskHandle = nullptr;
+
+    // FIX #1: Signal caller before self-deleting; _taskHandle must NOT be
+    // touched after this point — the caller will null it after unblocking.
+    xEventGroupSetBits(_eventGroup, CLOCK_BIT_STOPPED);
     vTaskDelete(nullptr);
 }
 
@@ -141,7 +201,6 @@ void ClockManager::renderToBuffer(uint8_t* out) {
     localtime_r(&now, &tm);
 
     // ── Time string ───────────────────────────────────────────────────────────
-    // We build the string ourselves to avoid printf overhead in a tight loop.
     char timeBuf[12] = {};
     int  h = tm.tm_hour;
     bool pm = false;
@@ -152,7 +211,6 @@ void ClockManager::renderToBuffer(uint8_t* out) {
         if (h == 0) h = 12;
     }
 
-    // HH:MM or HH:MM:SS
     int pos = 0;
     timeBuf[pos++] = '0' + h / 10;
     timeBuf[pos++] = '0' + h % 10;
@@ -168,29 +226,22 @@ void ClockManager::renderToBuffer(uint8_t* out) {
     timeBuf[pos] = '\0';
 
     // ── Colours (RGB565) ──────────────────────────────────────────────────────
-    // Green  0x07E0   Cyan  0x07FF   White 0xFFFF   Amber 0xFD20
-    uint16_t timeColor = 0x07E0;  // neon green — matches Flutter default
+    uint16_t timeColor = 0x07E0;  // neon green
     uint16_t dimColor  = 0x0320;  // dim green for date / AM-PM
 
     // ── Layout ────────────────────────────────────────────────────────────────
-    // Each digit glyph is 3px wide, gap 1px → 4px per char.
-    // Colon is also 3px wide. Scale 2 doubles everything.
-    int scale = 2; // glyph pixels → 2×2 screen pixels each
-
-    // Effective character width and height at this scale
+    int scale = 2;
     int charW = 3 * scale;
     int charH = 5 * scale;
     int gap   = 1 * scale;
 
-    // Calculate string pixel width for centering
     int strLen   = strlen(timeBuf);
     int totalW   = strLen * (charW + gap) - gap;
     int startX   = (MATRIX_COLS - totalW) / 2;
     int startY   = _cfg.showDate
-                   ? (MATRIX_ROWS / 2 - charH - scale)    // move up if date shown
-                   : (MATRIX_ROWS - charH) / 2;           // vertically centered
+                   ? (MATRIX_ROWS / 2 - charH - scale)
+                   : (MATRIX_ROWS - charH) / 2;
 
-    // Draw time string
     int cx = startX;
     for (int i = 0; i < strLen; i++) {
         _drawChar(out, cx, startY, timeBuf[i], timeColor, scale);
@@ -200,34 +251,31 @@ void ClockManager::renderToBuffer(uint8_t* out) {
     // ── AM/PM indicator (12-h mode) ───────────────────────────────────────────
     if (!_cfg.is24h) {
         char ampm[3] = { (char)(pm ? 'P' : 'A'), 'M', '\0' };
-        int ax = cx + scale * 2;                    // right of time
-        int ay = startY + charH - 5 * (scale / 2); // bottom-aligned
+        int ax = cx + scale * 2;
+        int ay = startY + charH - 5 * (scale / 2);
         _drawChar(out, ax,     ay, ampm[0], dimColor, scale / 2 + 1);
         _drawChar(out, ax + 4, ay, ampm[1], dimColor, scale / 2 + 1);
     }
 
     // ── Date line ─────────────────────────────────────────────────────────────
     if (_cfg.showDate) {
-        // Format: DD/MM/YYYY  — compact for the 64px width
         char dateBuf[12] = {};
         snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d",
                  tm.tm_mday, tm.tm_mon + 1, tm.tm_year + 1900);
 
-        // Date at scale 1 (small)
-        int dScale = 1;
-        int dCharW = 3 * dScale;
-        int dGap   = 1 * dScale;
-        int dLen   = strlen(dateBuf);
+        int dScale  = 1;
+        int dCharW  = 3 * dScale;
+        int dGap    = 1 * dScale;
+        int dLen    = strlen(dateBuf);
         int dTotalW = dLen * (dCharW + dGap) - dGap;
         int dx = (MATRIX_COLS - dTotalW) / 2;
-        int dy = startY + charH + scale * 2;  // below clock
+        int dy = startY + charH + scale * 2;
 
         for (int i = 0; i < dLen; i++) {
             _drawChar(out, dx, dy, dateBuf[i], dimColor, dScale);
             dx += dCharW + dGap;
         }
 
-        // Horizontal separator line between time and date
         int lineY  = startY + charH + scale;
         int lineX0 = MATRIX_COLS / 4;
         int lineX1 = MATRIX_COLS * 3 / 4;
@@ -249,7 +297,6 @@ void ClockManager::_drawChar(uint8_t* buf, int x, int y,
             bool lit = (mask >> (2 - col)) & 1;
             if (!lit) continue;
 
-            // Scale: draw scale×scale block per font pixel
             for (int sy = 0; sy < scale; sy++) {
                 for (int sx = 0; sx < scale; sx++) {
                     int px = x + col * scale + sx;
@@ -269,6 +316,6 @@ void ClockManager::_drawChar(uint8_t* buf, int x, int y,
 void ClockManager::_setPixel(uint8_t* buf, int col, int row, uint16_t color565) {
     size_t idx = ((size_t)row * MATRIX_COLS + col) * 2;
     if (idx + 1 >= FRAME_BYTES) return;
-    buf[idx]     = (color565 >> 8) & 0xFF;   // big-endian, matches wire format
+    buf[idx]     = (color565 >> 8) & 0xFF;
     buf[idx + 1] =  color565       & 0xFF;
 }
