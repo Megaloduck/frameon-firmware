@@ -1,2 +1,2 @@
-# 1/323 scan mode panel settings
+# 1/32 scan mode panel settings
 
