@@ -34,7 +34,7 @@ void matrix_init() {
     matrix->begin();
     matrix->setBrightness8(PANEL_BRIGHTNESS);
     matrix->clearScreen();
-    matrix->flushDMABuffer();
+    matrix->flipDMABuffer();
 }
 
 void matrix_brightness(uint8_t value) {
@@ -44,6 +44,6 @@ void matrix_brightness(uint8_t value) {
 void matrix_clear() {
     if (matrix) {
         matrix->clearScreen();
-        matrix->flushDMABuffer();
+        matrix->flipDMABuffer();
     }
 }
