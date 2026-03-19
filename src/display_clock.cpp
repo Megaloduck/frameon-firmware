@@ -10,6 +10,7 @@ static NTPClient *_ntp       = nullptr;
 static uint32_t   _lastSync  = 0;
 static int        _prevSecond = -1;
 
+// 5-row × 3-col bitmap font (digits 0-9 and colon at index 10)
 static const uint8_t FONT5x3[11][5] = {
     {0b111, 0b101, 0b101, 0b101, 0b111}, // 0
     {0b010, 0b110, 0b010, 0b010, 0b111}, // 1
@@ -50,9 +51,13 @@ static void _drawDateLine(const struct tm &t) {
     int textW  = strlen(buf) * 4;
     int startX = (PANEL_WIDTH - textW) / 2;
 
+    // Place date line 8px from the bottom of REAL_HEIGHT (not virtual 64).
+    // 8px text height → y = REAL_HEIGHT - 8 = 24, bottom at y=31 ✓
+    int dateY = REAL_HEIGHT - 8;   // 24
+
     matrix->setTextSize(1);
     matrix->setTextColor(COL_BLUE());
-    matrix->setCursor(startX, 24);
+    matrix->setCursor(startX, dateY);
     matrix->print(buf);
 }
 
@@ -77,13 +82,15 @@ void clock_draw() {
 
     matrix->clearScreen();
 
-    int      hour       = g_clockCfg.is24h
+    int hour = g_clockCfg.is24h
         ? timeinfo.tm_hour
         : (timeinfo.tm_hour % 12 == 0 ? 12 : timeinfo.tm_hour % 12);
+
     uint16_t timeColor  = COL_GREEN();
     uint16_t colonColor = (timeinfo.tm_sec % 2 == 0) ? COL_GREEN() : COL_DIM();
 
     if (g_clockCfg.showSeconds) {
+        // 1× font: 5px tall digits. y=6 → bottom at y=10 ✓
         int y = 6;
         _draw2Digits(2,  y, hour,            timeColor);
         _drawChar   (13, y, 10,              colonColor);
@@ -91,7 +98,10 @@ void clock_draw() {
         _drawChar   (27, y, 10,              colonColor);
         _draw2Digits(30, y, timeinfo.tm_sec, COL_DIM());
     } else {
+        // 2× scaled digits: 10px tall. y=9 → bottom at y=18 ✓
+        // With date line at y=24, leaves a 6px gap — comfortable.
         int y = 9;
+
         auto draw2x = [&](int x, int yy, int idx, uint16_t col) {
             if (idx < 0 || idx > 10) return;
             for (int row = 0; row < 5; row++) {
@@ -106,9 +116,15 @@ void clock_draw() {
                 }
             }
         };
-        int x = 17;
-        draw2x(x, y, (hour / 10) % 10,         timeColor); x += 7;
-        draw2x(x, y, hour % 10,                timeColor); x += 7;
+
+        // Centre HH:MM across 64px:
+        // Each 2× digit = 7px wide (6px + 1px gap), colon = 3px → total ~37px
+        // Start at x=13 to roughly centre.
+        int x = 13;
+        draw2x(x, y, (hour / 10) % 10,            timeColor); x += 7;
+        draw2x(x, y, hour % 10,                   timeColor); x += 7;
+
+        // Blinking colon — two pixel pairs
         if (timeinfo.tm_sec % 2 == 0) {
             matrix->drawPixel(x, y+2, colonColor);
             matrix->drawPixel(x, y+3, colonColor);
@@ -116,19 +132,22 @@ void clock_draw() {
             matrix->drawPixel(x, y+7, colonColor);
         }
         x += 3;
+
         draw2x(x, y, (timeinfo.tm_min / 10) % 10, timeColor); x += 7;
         draw2x(x, y, timeinfo.tm_min % 10,        timeColor);
 
+        // AM/PM indicator — right edge, within REAL_HEIGHT
         if (!g_clockCfg.is24h) {
             matrix->setTextSize(1);
             matrix->setTextColor(COL_DIM());
-            matrix->setCursor(55, 9);
+            matrix->setCursor(57, 9);    // y=9, bottom at y=16 ✓
             matrix->print(timeinfo.tm_hour < 12 ? "A" : "P");
-            matrix->setCursor(55, 15);
+            matrix->setCursor(57, 16);   // y=16, bottom at y=23 ✓
             matrix->print("M");
         }
     }
 
     if (g_clockCfg.showDate) _drawDateLine(timeinfo);
+
     matrix->flipDMABuffer();
 }

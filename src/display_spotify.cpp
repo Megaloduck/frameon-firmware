@@ -14,6 +14,7 @@ static void _drawScrollingText(const String &line1, const String &line2) {
 
     if (millis() - _lastScroll > 80) {
         _lastScroll = millis();
+        // Right half is 32 px wide; scroll if text wider than that
         int textWidth = line1.length() * 6;
         if (textWidth > 32) {
             _scrollOffset++;
@@ -21,35 +22,44 @@ static void _drawScrollingText(const String &line1, const String &line2) {
         }
     }
 
+    // Track name — scrolling, right half starting at x=32
     matrix->setTextSize(1);
     matrix->setTextColor(COL_WHITE());
-    matrix->setCursor(32 - _scrollOffset, 2);
+    matrix->setCursor(32 - _scrollOffset, 2);   // y=2, bottom at y=9 ✓
     matrix->print(line1);
 
+    // Artist name — truncate to 5 chars to fit right half
     matrix->setTextColor(rgb(150, 150, 150));
-    matrix->setCursor(32, 12);
+    matrix->setCursor(32, 12);                   // y=12, bottom at y=19 ✓
     String artist = line2;
     if (artist.length() > 5) artist = artist.substring(0, 5);
     matrix->print(artist);
 
+    // Play/pause indicator — right half, bottom area
+    // y=22, height=8 → bottom at y=29 ✓ (within REAL_HEIGHT=32)
     uint16_t playColor = g_spotify.isPlaying ? COL_SPOTIFY() : COL_DIM();
     matrix->fillRect(32, 22, 10, 8, COL_BLACK());
     if (g_spotify.isPlaying) {
+        // Play triangle (filled approximation)
         for (int i = 0; i < 4; i++) {
             matrix->drawFastVLine(32 + i, 22 + i, 8 - i * 2, playColor);
         }
     } else {
+        // Pause bars
         matrix->drawFastVLine(32, 22, 8, playColor);
         matrix->drawFastVLine(35, 22, 8, playColor);
     }
 }
 
 static void _drawArtPlaceholder() {
-    matrix->fillRect(0, 0, 32, 32, rgb(10, 20, 15));
-    matrix->drawRect(0, 0, 32, 32, COL_SPOTIFY());
+    // Album art occupies the left 32×REAL_HEIGHT area.
+    // Use REAL_HEIGHT (32) — NOT the virtual PANEL_HEIGHT (64).
+    matrix->fillRect(0, 0, 32, REAL_HEIGHT, rgb(10, 20, 15));
+    matrix->drawRect(0, 0, 32, REAL_HEIGHT, COL_SPOTIFY());
+
     matrix->setTextColor(COL_SPOTIFY());
     matrix->setTextSize(2);
-    matrix->setCursor(8, 8);
+    matrix->setCursor(8, 8);   // 16px tall text → bottom at y=23 ✓
     matrix->print("S");
 }
 

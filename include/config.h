@@ -1,9 +1,16 @@
 #pragma once
 
 // ── Panel geometry ────────────────────────────────────────────────────────
-#define PANEL_WIDTH      64
-#define PANEL_HEIGHT     32
-#define PANEL_CHAIN      1      // number of panels chained horizontally
+// P4-2121-64x32-32S-JHT3.0 requires a 1/32 scan rate, which the HUB75 DMA
+// library only activates when PANEL_HEIGHT >= 64 (forces E-pin toggling).
+// We lie to the library and declare a 64-row virtual canvas; physical pixels
+// exist only in rows 0–(REAL_HEIGHT-1).  All draw calls must stay within
+// y < REAL_HEIGHT — the virtual rows 32–63 simply don't appear on the panel.
+#define PANEL_WIDTH    64
+#define PANEL_HEIGHT   64   // virtual — tells library to enable E-pin / 1/32 scan
+#define REAL_HEIGHT    32   // physical rows actually on the panel
+#define PANEL_CHAIN     1   // single panel chained horizontally
+
 #define PANEL_BRIGHTNESS 128    // 0–255, default startup brightness
 
 // ── HUB75 pin mapping (ESP32-S3 custom wiring) ───────────────────────────
@@ -17,7 +24,7 @@
 #define PIN_B   39
 #define PIN_C   40
 #define PIN_D   41
-#define PIN_E   42   // 1/32 scan — required for 32-row panels
+#define PIN_E   42   // E-pin required for 1/32 scan
 #define PIN_CLK  2
 #define PIN_LAT  1
 #define PIN_OE  16
@@ -41,9 +48,9 @@
 
 // ── App modes ─────────────────────────────────────────────────────────────
 enum AppMode {
-  MODE_CLOCK   = 0,
-  MODE_SPOTIFY = 1,
-  MODE_GIF     = 2,
+  MODE_CLOCK    = 0,
+  MODE_SPOTIFY  = 1,
+  MODE_GIF      = 2,
   MODE_POMODORO = 3
 };
 
