@@ -1,107 +1,160 @@
 #include <Arduino.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+#include <WiFi.h>
+#include <time.h>
+
 #include "config.h"
-#include "display_manager.h"
-#include "ble_server.h"
-#include "clock_manager.h"
+#include "matrix.h"
+#include "wifi_manager.h"
+#include "api_server.h"
+#include "display_clock.h"
+#include "display_pomodoro.h"
+#include "display_spotify.h"
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  main.cpp  —  Frameon ESP32-S3 firmware
-//
-//  Boot sequence:
-//    1. Serial (debug logging)
-//    2. PSRAM check
-//    3. HUB75 display initialisation
-//    4. BLE server (begins advertising immediately)
-//    5. Display FreeRTOS task (owns GIF playback timing)
-//
-//  All ongoing work runs in FreeRTOS tasks pinned to core 1.
-//  BLE / NimBLE uses core 0.  loop() is essentially idle.
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Global preferences ────────────────────────────────────────────────────
+static Preferences prefs;
 
-// Forward declaration
-static void showSplash();
+// ── Boot screen ───────────────────────────────────────────────────────────
+static void _showBootScreen() {
+    matrix->clearScreen();
 
-void setup() {
-    Serial.begin(115200);
-    delay(500); // allow USB CDC to attach on ESP32-S3
+    // "FRAMEON" in green across the middle
+    matrix->setTextSize(1);
+    matrix->setTextColor(COL_GREEN);
+    matrix->setCursor(4, 4);
+    matrix->print("FRAMEON");
 
-    LOG("============================================");
-    LOG(" Frameon firmware  (build: " __DATE__ " " __TIME__ ")");
-    LOG("============================================");
-    LOG("Free heap at boot: %u bytes", ESP.getFreeHeap());
+    // Horizontal accent line
+    matrix->drawFastHLine(0, 13, PANEL_WIDTH, COL_GREEN);
 
-    // ── PSRAM check ───────────────────────────────────────────────────────────
-    if (psramFound()) {
-        LOG("PSRAM OK: %u bytes free", ESP.getFreePsram());
+    // Status line
+    matrix->setTextColor(rgb(60, 60, 60));
+    matrix->setCursor(4, 16);
+    matrix->print("Starting...");
+
+    matrix->flushDMABuffer();
+}
+
+static void _showWifiScreen(bool connected, const String &ip) {
+    matrix->clearScreen();
+    matrix->setTextSize(1);
+
+    if (connected) {
+        matrix->setTextColor(COL_GREEN);
+        matrix->setCursor(2, 2);
+        matrix->print("WiFi OK");
+        matrix->setTextColor(rgb(80, 80, 80));
+        matrix->setCursor(2, 12);
+        // Show last two octets of IP to fit 64px
+        int lastDot  = ip.lastIndexOf('.');
+        int firstDot = ip.indexOf('.');
+        matrix->print(ip.substring(firstDot + 1));
+        matrix->setCursor(2, 22);
+        matrix->print("/update");
     } else {
-        LOG("WARNING: No PSRAM — frame buffers will use SRAM.");
-        LOG("  Recommend ESP32-S3-N8R8 (8 MB Flash, 8 MB PSRAM).");
+        matrix->setTextColor(COL_ORANGE);
+        matrix->setCursor(2, 2);
+        matrix->print("No WiFi");
+        matrix->setTextColor(rgb(60, 60, 60));
+        matrix->setCursor(2, 12);
+        matrix->print("Use app");
+        matrix->setCursor(2, 20);
+        matrix->print("to setup");
     }
 
-    // ── Display ───────────────────────────────────────────────────────────────
-    if (!Display().begin()) {
-        LOG("FATAL: HUB75 panel init failed.  Check wiring.  Halting.");
-        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    showSplash();
-
-    // ── BLE ───────────────────────────────────────────────────────────────────
-    Ble().begin();
-
-    // ── Display FreeRTOS task ─────────────────────────────────────────────────
-    Display().startTask();
-
-    LOG("Boot complete.  Free heap: %u bytes", ESP.getFreeHeap());
-    LOG("Advertising as '%s' — waiting for phone connection...", BLE_DEVICE_NAME);
+    matrix->flushDMABuffer();
+    delay(2500);
 }
 
-// ── Splash: simple frame to confirm the panel is alive ────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────────────
+void setup() {
+    Serial.begin(SERIAL_BAUD);
+    delay(300); // let CDC settle on S3
 
-static void showSplash() {
-    MatrixPanel_I2S_DMA* p = Display().panel();
-    if (!p) return;
+    Serial.println("\n[Frameon] Booting...");
+    Serial.printf("[Frameon] ESP32-S3 N16R8 | Flash 16MB | PSRAM 8MB\n");
 
-    p->clearScreen();
+    // ── Matrix ────────────────────────────────────────────────────────
+    matrix_init();
+    _showBootScreen();
 
-    // Cyan border
-    uint16_t cyan  = p->color565(0, 200, 255);
-    uint16_t white = p->color565(255, 255, 255);
+    // ── Preferences ───────────────────────────────────────────────────
+    prefs.begin(PREF_NS, false);
 
-    for (int x = 0; x < MATRIX_COLS; x++) {
-        p->drawPixelRGB565(x, 0,               cyan);
-        p->drawPixelRGB565(x, MATRIX_ROWS - 1, cyan);
+    // ── SPIFFS ────────────────────────────────────────────────────────
+    if (!SPIFFS.begin(true)) {
+        Serial.println("[SPIFFS] Mount failed — formatting...");
+        SPIFFS.format();
+        SPIFFS.begin(true);
     }
-    for (int y = 1; y < MATRIX_ROWS - 1; y++) {
-        p->drawPixelRGB565(0,              y, cyan);
-        p->drawPixelRGB565(MATRIX_COLS-1, y, cyan);
+    Serial.printf("[SPIFFS] Total: %u KB, Used: %u KB\n",
+        SPIFFS.totalBytes() / 1024, SPIFFS.usedBytes() / 1024);
+
+    // ── Wi-Fi ─────────────────────────────────────────────────────────
+    wifi_init(prefs);
+
+    // ── API + OTA server ──────────────────────────────────────────────
+    if (wifi_connected()) {
+        api_init(prefs);
+        clock_init(prefs.getString(PREF_NTP_SERVER, NTP_DEFAULT_SERVER).c_str());
     }
 
-    // 2×2 white dot at centre to confirm pixel order
-    int cx = MATRIX_COLS / 2 - 1;
-    int cy = MATRIX_ROWS / 2 - 1;
-    p->drawPixelRGB565(cx,   cy,   white);
-    p->drawPixelRGB565(cx+1, cy,   white);
-    p->drawPixelRGB565(cx,   cy+1, white);
-    p->drawPixelRGB565(cx+1, cy+1, white);
+    _showWifiScreen(wifi_connected(), wifi_ip());
 
-    p->flipDMABuffer();
-    delay(1200);
-    p->clearScreen();
-    p->flipDMABuffer();
+    Serial.println("[Frameon] Boot complete.");
+    Serial.printf("[Frameon] Mode: %d | Brightness: %d\n", g_mode, g_brightness);
 }
 
-// ── loop() ────────────────────────────────────────────────────────────────────
-
+// ── Loop ──────────────────────────────────────────────────────────────────
 void loop() {
-#if FRAMEON_DEBUG
-    static uint32_t lastLog = 0;
-    if (millis() - lastLog >= 15000) {
-        lastLog = millis();
-        LOG("Heap: %u | PSRAM: %u | BLE: %s",
-            ESP.getFreeHeap(),
-            psramFound() ? ESP.getFreePsram() : 0u,
-            Ble().isConnected() ? "connected" : "advertising");
+    // ── Wi-Fi watchdog + Serial provisioning ──────────────────────────
+    bool newConn = wifi_loop(prefs);
+    if (newConn) {
+        // Just connected (or reconnected) — start API and NTP if needed
+        api_init(prefs);
+        clock_init(prefs.getString(PREF_NTP_SERVER, NTP_DEFAULT_SERVER).c_str());
+        Serial.printf("[Frameon] Online. IP: %s\n", wifi_ip().c_str());
     }
-#endif
-    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // ── API + OTA loop ─────────────────────────────────────────────────
+    if (wifi_connected()) {
+        api_loop();
+    }
+
+    // ── Display dispatch ───────────────────────────────────────────────
+    switch (g_mode) {
+        case MODE_CLOCK:
+            if (wifi_connected()) clock_draw();
+            else {
+                // No WiFi — show a static "no time" message
+                static uint32_t _noWifiMsg = 0;
+                if (millis() - _noWifiMsg > 5000) {
+                    _noWifiMsg = millis();
+                    matrix->clearScreen();
+                    matrix->setTextColor(COL_DIM);
+                    matrix->setTextSize(1);
+                    matrix->setCursor(4, 12);
+                    matrix->print("No WiFi");
+                    matrix->flushDMABuffer();
+                }
+            }
+            break;
+
+        case MODE_SPOTIFY:
+            spotify_draw();
+            break;
+
+        case MODE_GIF:
+            // GIF display module — placeholder, implement with AnimatedGIF
+            // TODO: gif_draw();
+            break;
+
+        case MODE_POMODORO:
+            pomodoro_draw();
+            break;
+    }
+
+    // Small yield to prevent watchdog triggers on S3
+    delay(1);
 }
