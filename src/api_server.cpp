@@ -1,23 +1,32 @@
 #include "api_server.h"
 #include "matrix.h"
 #include <ArduinoJson.h>
+
+// Must be defined BEFORE including ElegantOTA.h to select the AsyncWebServer
+// overload of ElegantOTA.begin(). The build flag in platformio.ini sets this
+// for all TUs; this guard is belt-and-suspenders for IntelliSense / direct
+// compilation of this file in isolation.
+#ifndef ELEGANTOTA_USE_ASYNC_WEBSERVER
+  #define ELEGANTOTA_USE_ASYNC_WEBSERVER 1
+#endif
 #include <ElegantOTA.h>
-#include <SPIFFS.h>       // FIX: was missing — needed for GIF list/upload/delete
+
+#include <SPIFFS.h>
 #include <WiFi.h>
 
 // ── Globals (defined here, declared extern in api_server.h) ──────────────
-AppMode      g_mode       = MODE_CLOCK;
-uint8_t      g_brightness = PANEL_BRIGHTNESS;
-ClockConfig  g_clockCfg;
-SpotifyState g_spotify;
+AppMode        g_mode       = MODE_CLOCK;
+uint8_t        g_brightness = PANEL_BRIGHTNESS;
+ClockConfig    g_clockCfg;
+SpotifyState   g_spotify;
 PomodoroConfig g_pomoCfg;
 PomodoroTimer  g_pomoTimer;
 
 // ── Server instances ──────────────────────────────────────────────────────
 static AsyncWebServer _server(API_PORT);
 static AsyncWebSocket _ws(WS_PATH);
-static Preferences   *_prefs     = nullptr;
-static bool           _apiStarted = false;   // FIX: double-init guard
+static Preferences   *_prefs      = nullptr;
+static bool           _apiStarted = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -118,7 +127,6 @@ static void _handleSpotifyState(AsyncWebServerRequest *req, JsonDocument &body) 
     g_spotify.artist    = body["artist"]  | "";
     g_spotify.isPlaying = body["playing"] | false;
     if (!body["art"].isNull()) {
-        // FIX: store as String instead of 6KB stack array
         g_spotify.artBase64 = body["art"].as<String>();
         g_spotify.hasArt    = true;
     }
@@ -173,7 +181,6 @@ static void _handleGifList(AsyncWebServerRequest *req) {
             if (!f.isDirectory()) {
                 JsonObject entry = files.add<JsonObject>();
                 String name = String(f.name());
-                // Strip leading "/gifs/" prefix if present
                 if (name.startsWith("/gifs/")) name = name.substring(6);
                 entry["name"]    = name;
                 entry["size"]    = f.size();
@@ -275,51 +282,43 @@ static void _handleGifUpload(AsyncWebServerRequest *req, String filename,
 // ── Init ──────────────────────────────────────────────────────────────────
 
 void api_init(Preferences &prefs) {
-    // FIX: guard against double-init on reconnect
     if (_apiStarted) {
-        // Already running — just reload config from prefs in case it changed
         _prefs = &prefs;
         return;
     }
     _apiStarted = true;
     _prefs = &prefs;
 
-    // Load persisted config
-    g_brightness                 = prefs.getInt   (PREF_BRIGHTNESS,    PANEL_BRIGHTNESS);
-    g_mode                       = (AppMode)prefs.getInt(PREF_MODE,    MODE_CLOCK);
-    g_clockCfg.is24h             = prefs.getBool  (PREF_CLOCK_24H,    true);
-    g_clockCfg.showDate          = prefs.getBool  (PREF_CLOCK_DATE,   true);
-    g_clockCfg.showSeconds       = prefs.getBool  (PREF_CLOCK_SECS,   false);
-    g_clockCfg.timezone          = prefs.getString(PREF_TIMEZONE,     "UTC0");
-    g_clockCfg.ntpServer         = prefs.getString(PREF_NTP_SERVER,   "pool.ntp.org");
-    g_pomoCfg.workMinutes        = prefs.getInt   (PREF_POMO_WORK,    25);
-    g_pomoCfg.shortBreakMinutes  = prefs.getInt   (PREF_POMO_SHORT,   5);
-    g_pomoCfg.longBreakMinutes   = prefs.getInt   (PREF_POMO_LONG,    15);
+    g_brightness                 = prefs.getInt   (PREF_BRIGHTNESS,     PANEL_BRIGHTNESS);
+    g_mode                       = (AppMode)prefs.getInt(PREF_MODE,     MODE_CLOCK);
+    g_clockCfg.is24h             = prefs.getBool  (PREF_CLOCK_24H,     true);
+    g_clockCfg.showDate          = prefs.getBool  (PREF_CLOCK_DATE,    true);
+    g_clockCfg.showSeconds       = prefs.getBool  (PREF_CLOCK_SECS,    false);
+    g_clockCfg.timezone          = prefs.getString(PREF_TIMEZONE,      "UTC0");
+    g_clockCfg.ntpServer         = prefs.getString(PREF_NTP_SERVER,    "pool.ntp.org");
+    g_pomoCfg.workMinutes        = prefs.getInt   (PREF_POMO_WORK,     25);
+    g_pomoCfg.shortBreakMinutes  = prefs.getInt   (PREF_POMO_SHORT,    5);
+    g_pomoCfg.longBreakMinutes   = prefs.getInt   (PREF_POMO_LONG,     15);
     g_pomoCfg.sessionsBeforeLong = prefs.getInt   (PREF_POMO_SESSIONS, 4);
-
     g_pomoTimer.secondsRemaining = g_pomoCfg.workMinutes * 60;
 
     setenv("TZ", g_clockCfg.timezone.c_str(), 1);
     tzset();
     matrix_brightness(g_brightness);
 
-    // WebSocket
     _ws.onEvent(_onWsEvent);
     _server.addHandler(&_ws);
 
-    // CORS
     DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin",  "*");
     DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
     DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
 
     _server.on("/*", HTTP_OPTIONS, [](AsyncWebServerRequest *req) { req->send(200); });
 
-    // GET
     _server.on("/api/ping",     HTTP_GET, _handlePing);
     _server.on("/api/info",     HTTP_GET, _handleInfo);
     _server.on("/api/gif/list", HTTP_GET, _handleGifList);
 
-    // POST (JSON body)
     _registerJsonRoute("/api/mode",            HTTP_POST,   _handleSetMode);
     _registerJsonRoute("/api/brightness",      HTTP_POST,   _handleBrightness);
     _registerJsonRoute("/api/clock/config",    HTTP_POST,   _handleClockConfig);
@@ -330,26 +329,24 @@ void api_init(Preferences &prefs) {
     _registerJsonRoute("/api/gif/select",      HTTP_POST,   _handleGifSelect);
     _registerJsonRoute("/api/gif/delete",      HTTP_DELETE, _handleGifDelete);
 
-    // GIF upload
     _server.on("/api/gif/upload", HTTP_POST,
         [](AsyncWebServerRequest *req) { req->send(200); },
         _handleGifUpload
     );
 
-    // ElegantOTA
+    // ElegantOTA v3 — accepts AsyncWebServer* only when
+    // ELEGANTOTA_USE_ASYNC_WEBSERVER=1 (set above + in platformio.ini)
     ElegantOTA.begin(&_server);
 
     _server.begin();
     Serial.printf("[API] Server started on port %d\n", API_PORT);
-    Serial.printf("[OTA] ElegantOTA → http://%s/update\n",
-                  WiFi.localIP().toString().c_str());
+    Serial.printf("[OTA] http://%s/update\n", WiFi.localIP().toString().c_str());
 }
 
 void api_loop() {
     ElegantOTA.loop();
     _ws.cleanupClients();
 
-    // Pomodoro tick
     if (g_pomoTimer.running && millis() - g_pomoTimer.lastTick >= 1000) {
         g_pomoTimer.lastTick = millis();
         if (g_pomoTimer.secondsRemaining > 0) {
