@@ -8,6 +8,7 @@
 #include "matrix.h"
 #include "wifi_manager.h"
 #include "api_server.h"
+#include "usb_api.h"          // ← required: USB command dispatcher
 #include "display_clock.h"
 #include "display_pomodoro.h"
 #include "display_spotify.h"
@@ -18,11 +19,11 @@ static void _showBootScreen() {
     matrix->clearScreen();
     matrix->setTextSize(1);
     matrix->setTextColor(COL_GREEN());
-    matrix->setCursor(4, 4);          // y=4, bottom at y=11 ✓
+    matrix->setCursor(4, 4);
     matrix->print("FRAMEON");
-    matrix->drawFastHLine(0, 13, PANEL_WIDTH, COL_GREEN());  // y=13 ✓
+    matrix->drawFastHLine(0, 13, PANEL_WIDTH, COL_GREEN());
     matrix->setTextColor(rgb(60, 60, 60));
-    matrix->setCursor(4, 16);         // y=16, bottom at y=23 ✓
+    matrix->setCursor(4, 16);
     matrix->print("Starting...");
     matrix->flipDMABuffer();
 }
@@ -33,27 +34,26 @@ static void _showWifiScreen(bool connected, const String &ip) {
 
     if (connected) {
         matrix->setTextColor(COL_GREEN());
-        matrix->setCursor(2, 2);      // y=2  ✓
+        matrix->setCursor(2, 2);
         matrix->print("WiFi OK");
 
         matrix->setTextColor(rgb(80, 80, 80));
-        matrix->setCursor(2, 12);     // y=12 ✓
-        // Show last two octets to fit 64px wide display
+        matrix->setCursor(2, 12);
         int firstDot = ip.indexOf('.');
         matrix->print(ip.substring(firstDot + 1));
 
-        matrix->setCursor(2, 22);     // y=22, bottom at y=29 ✓
+        matrix->setCursor(2, 22);
         matrix->print("/update");
     } else {
         matrix->setTextColor(COL_ORANGE());
-        matrix->setCursor(2, 2);      // y=2  ✓
+        matrix->setCursor(2, 2);
         matrix->print("No WiFi");
 
         matrix->setTextColor(rgb(60, 60, 60));
-        matrix->setCursor(2, 12);     // y=12 ✓
+        matrix->setCursor(2, 12);
         matrix->print("Use app");
 
-        matrix->setCursor(2, 20);     // y=20, bottom at y=27 ✓
+        matrix->setCursor(2, 20);
         matrix->print("to setup");
     }
 
@@ -83,6 +83,9 @@ void setup() {
     Serial.printf("[SPIFFS] %u KB total, %u KB used\n",
         SPIFFS.totalBytes() / 1024, SPIFFS.usedBytes() / 1024);
 
+    // ── USB API: init before WiFi so commands work without a network ────
+    usb_api_init(prefs);
+
     wifi_init(prefs);
 
     if (wifi_connected()) {
@@ -92,22 +95,35 @@ void setup() {
 
     _showWifiScreen(wifi_connected(), wifi_ip());
 
+    // Push boot status to USB host
+    String statusJson = "{\"connected\":" + String(wifi_connected() ? "true" : "false") +
+                        ",\"ip\":\"" + wifi_ip() + "\"" +
+                        ",\"mode\":" + String((int)g_mode) +
+                        ",\"brightness\":" + String(g_brightness) + "}";
+    usb_push("boot", statusJson);
+
     Serial.println("[Frameon] Boot complete.");
     Serial.printf("[Frameon] Mode: %d | Brightness: %d\n", g_mode, g_brightness);
 }
 
 void loop() {
+    // ── USB API runs first — highest priority, no WiFi dependency ───────
+    usb_api_loop(prefs);
+
+    // ── WiFi reconnect + legacy serial provisioning ──────────────────────
     bool newConn = wifi_loop(prefs);
     if (newConn) {
         api_init(prefs);
         clock_init(prefs.getString(PREF_NTP_SERVER, NTP_DEFAULT_SERVER).c_str());
         Serial.printf("[Frameon] Online. IP: %s\n", wifi_ip().c_str());
+        usb_push("wifi_connected", "{\"ip\":\"" + wifi_ip() + "\"}");
     }
 
     if (wifi_connected()) {
         api_loop();
     }
 
+    // ── Display dispatch ─────────────────────────────────────────────────
     switch (g_mode) {
         case MODE_CLOCK:
             if (wifi_connected()) {
@@ -119,7 +135,7 @@ void loop() {
                     matrix->clearScreen();
                     matrix->setTextColor(COL_DIM());
                     matrix->setTextSize(1);
-                    matrix->setCursor(4, 12);   // y=12, bottom at y=19 ✓
+                    matrix->setCursor(4, 12);
                     matrix->print("No WiFi");
                     matrix->flipDMABuffer();
                 }

@@ -8,9 +8,12 @@
 // Call once in setup() — reads saved credentials and connects if available.
 void wifi_init(Preferences &prefs);
 
-// Call in loop() — handles reconnection and Serial provisioning commands.
-// Returns true if a new IP was assigned (useful for updating display).
+// Call in loop() — handles reconnection. Serial reading removed (usb_api owns Serial).
+// Returns true if a new IP was assigned.
 bool wifi_loop(Preferences &prefs);
+
+// Called by usb_api.cpp after a successful USB-provisioned WiFi connect.
+void wifi_set_connected(const String &ip);
 
 // Returns true if currently connected.
 bool wifi_connected();

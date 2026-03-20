@@ -99,7 +99,8 @@ static void _handleBrightness(AsyncWebServerRequest *req, JsonDocument &body) {
     _ok(req);
 }
 
-static void _handleClockConfig(AsyncWebServerRequest *req, JsonDocument &body) {
+
+    static void _handleClockConfig(AsyncWebServerRequest *req, JsonDocument &body) {
     if (!body["format24h"].isNull())   g_clockCfg.is24h       = body["format24h"].as<bool>();
     if (!body["showDate"].isNull())    g_clockCfg.showDate    = body["showDate"].as<bool>();
     if (!body["showSeconds"].isNull()) g_clockCfg.showSeconds = body["showSeconds"].as<bool>();
@@ -109,9 +110,6 @@ static void _handleClockConfig(AsyncWebServerRequest *req, JsonDocument &body) {
         g_brightness = constrain((int)body["brightness"], 0, 255);
         matrix_brightness(g_brightness);
     }
-    setenv("TZ", g_clockCfg.timezone.c_str(), 1);
-    tzset();
-
     if (_prefs) {
         _prefs->putBool  (PREF_CLOCK_24H,  g_clockCfg.is24h);
         _prefs->putBool  (PREF_CLOCK_DATE, g_clockCfg.showDate);
@@ -119,7 +117,10 @@ static void _handleClockConfig(AsyncWebServerRequest *req, JsonDocument &body) {
         _prefs->putString(PREF_TIMEZONE,   g_clockCfg.timezone);
         _prefs->putString(PREF_NTP_SERVER, g_clockCfg.ntpServer);
     }
+    // Send HTTP response FIRST, then do the blocking tzset call
     _ok(req);
+    setenv("TZ", g_clockCfg.timezone.c_str(), 1);
+    tzset();
 }
 
 static void _handleSpotifyState(AsyncWebServerRequest *req, JsonDocument &body) {
