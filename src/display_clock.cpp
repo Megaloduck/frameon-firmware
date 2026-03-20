@@ -6,11 +6,11 @@
 #include <time.h>
 
 static WiFiUDP    _udp;
-static NTPClient *_ntp       = nullptr;
-static uint32_t   _lastSync  = 0;
+static NTPClient *_ntp        = nullptr;
+static uint32_t   _lastSync   = 0;
 static int        _prevSecond = -1;
 
-// 5-row × 3-col bitmap font (digits 0-9 and colon at index 10)
+// 5-row × 3-col bitmap font (digits 0–9, colon at index 10)
 static const uint8_t FONT5x3[11][5] = {
     {0b111, 0b101, 0b101, 0b101, 0b111}, // 0
     {0b010, 0b110, 0b010, 0b010, 0b111}, // 1
@@ -50,10 +50,7 @@ static void _drawDateLine(const struct tm &t) {
 
     int textW  = strlen(buf) * 4;
     int startX = (PANEL_WIDTH - textW) / 2;
-
-    // Place date line 8px from the bottom of REAL_HEIGHT (not virtual 64).
-    // 8px text height → y = REAL_HEIGHT - 8 = 24, bottom at y=31 ✓
-    int dateY = REAL_HEIGHT - 8;   // 24
+    int dateY  = REAL_HEIGHT - 8; // 24
 
     matrix->setTextSize(1);
     matrix->setTextColor(COL_BLUE());
@@ -65,13 +62,21 @@ void clock_init(const char *ntpServer) {
     if (_ntp) { delete _ntp; _ntp = nullptr; }
     _ntp = new NTPClient(_udp, ntpServer, 0, NTP_UPDATE_INTERVAL);
     _ntp->begin();
-    _ntp->update();
-    Serial.printf("[Clock] NTP init: %s\n", ntpServer);
+    // FIX: do NOT call _ntp->update() here.
+    // _ntp->update() is a blocking UDP call that can take 1-2 seconds,
+    // which prevents usb_api_loop() from running and causes 8s timeouts
+    // on any USB command sent immediately after WiFi connects.
+    // The first clock_draw() call will trigger forceUpdate() via the
+    // _lastSync == 0 check, which is the correct non-blocking init path.
+    _lastSync   = 0;    // force update on first clock_draw() call
+    _prevSecond = -1;   // force redraw on first clock_draw() call
+    Serial.printf("[Clock] NTP init (deferred sync): %s\n", ntpServer);
 }
 
 void clock_draw() {
-    if (_ntp && millis() - _lastSync > NTP_UPDATE_INTERVAL) {
-        _ntp->update();
+    // Sync NTP if enough time has passed (or on first call when _lastSync==0)
+    if (_ntp && (millis() - _lastSync > NTP_UPDATE_INTERVAL || _lastSync == 0)) {
+        _ntp->update(); // non-blocking on subsequent calls; may block once at start
         _lastSync = millis();
     }
 
@@ -90,7 +95,6 @@ void clock_draw() {
     uint16_t colonColor = (timeinfo.tm_sec % 2 == 0) ? COL_GREEN() : COL_DIM();
 
     if (g_clockCfg.showSeconds) {
-        // 1× font: 5px tall digits. y=6 → bottom at y=10 ✓
         int y = 6;
         _draw2Digits(2,  y, hour,            timeColor);
         _drawChar   (13, y, 10,              colonColor);
@@ -98,10 +102,7 @@ void clock_draw() {
         _drawChar   (27, y, 10,              colonColor);
         _draw2Digits(30, y, timeinfo.tm_sec, COL_DIM());
     } else {
-        // 2× scaled digits: 10px tall. y=9 → bottom at y=18 ✓
-        // With date line at y=24, leaves a 6px gap — comfortable.
         int y = 9;
-
         auto draw2x = [&](int x, int yy, int idx, uint16_t col) {
             if (idx < 0 || idx > 10) return;
             for (int row = 0; row < 5; row++) {
@@ -117,14 +118,10 @@ void clock_draw() {
             }
         };
 
-        // Centre HH:MM across 64px:
-        // Each 2× digit = 7px wide (6px + 1px gap), colon = 3px → total ~37px
-        // Start at x=13 to roughly centre.
         int x = 13;
         draw2x(x, y, (hour / 10) % 10,            timeColor); x += 7;
         draw2x(x, y, hour % 10,                   timeColor); x += 7;
 
-        // Blinking colon — two pixel pairs
         if (timeinfo.tm_sec % 2 == 0) {
             matrix->drawPixel(x, y+2, colonColor);
             matrix->drawPixel(x, y+3, colonColor);
@@ -136,13 +133,12 @@ void clock_draw() {
         draw2x(x, y, (timeinfo.tm_min / 10) % 10, timeColor); x += 7;
         draw2x(x, y, timeinfo.tm_min % 10,        timeColor);
 
-        // AM/PM indicator — right edge, within REAL_HEIGHT
         if (!g_clockCfg.is24h) {
             matrix->setTextSize(1);
             matrix->setTextColor(COL_DIM());
-            matrix->setCursor(57, 9);    // y=9, bottom at y=16 ✓
+            matrix->setCursor(57, 9);
             matrix->print(timeinfo.tm_hour < 12 ? "A" : "P");
-            matrix->setCursor(57, 16);   // y=16, bottom at y=23 ✓
+            matrix->setCursor(57, 16);
             matrix->print("M");
         }
     }

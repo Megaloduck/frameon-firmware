@@ -1,7 +1,7 @@
 #include "usb_api.h"
-#include "api_server.h"   // g_mode, g_brightness, g_clockCfg, g_pomoCfg, g_pomoTimer
-#include "matrix.h"       // matrix_brightness()
-#include "wifi_manager.h" // wifi_connected(), wifi_ip(), wifi_set_connected()
+#include "api_server.h"
+#include "matrix.h"
+#include "wifi_manager.h"
 #include "config.h"
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
@@ -9,32 +9,33 @@
 
 // ── State ─────────────────────────────────────────────────────────────────
 
-static String   _buf;               // incoming serial line buffer
-static bool     _gifOpen  = false;  // GIF upload in progress
+static String   _buf;
+static bool     _gifOpen     = false;
 static File     _gifFile;
 static String   _gifPath;
-static uint32_t _gifTotal = 0;
+static uint32_t _gifTotal    = 0;
 static uint32_t _gifReceived = 0;
+
+// ── Non-blocking WiFi connect state ──────────────────────────────────────
+// WiFi connection is started in _handleWifi() and completed asynchronously
+// in usb_api_loop(). This prevents blocking the serial loop for 15 seconds.
+static bool     _wifiConnecting   = false;
+static String   _wifiPendingId    = "";
+static uint32_t _wifiConnectStart = 0;
+static const uint32_t WIFI_ASYNC_TIMEOUT = 15000; // ms
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 static void _reply(const String &id, bool ok,
                    const String &data = "", const String &error = "") {
-    // Build minimal JSON manually to avoid heap churn on large payloads
     String out = "{\"id\":\"" + id + "\",\"ok\":" + (ok ? "true" : "false");
-    if (data.length())  out += ",\"data\":"  + data;
+    if (data.length())  out += ",\"data\":"   + data;
     if (error.length()) out += ",\"error\":\"" + error + "\"";
     out += "}\n";
     Serial.print(out);
 }
-
-static void _replyOk(const String &id, const String &data = "") {
-    _reply(id, true, data);
-}
-
-static void _replyErr(const String &id, const String &msg) {
-    _reply(id, false, "", msg);
-}
+static void _replyOk(const String &id, const String &data = "") { _reply(id, true, data); }
+static void _replyErr(const String &id, const String &msg)       { _reply(id, false, "", msg); }
 
 // ── Command handlers ──────────────────────────────────────────────────────
 
@@ -49,8 +50,7 @@ static void _handleStatus(const String &id, JsonDocument &) {
     doc["mode"]       = (int)g_mode;
     doc["brightness"] = g_brightness;
     doc["fw"]         = "1.0.0";
-    String out;
-    serializeJson(doc, out);
+    String out; serializeJson(doc, out);
     _replyOk(id, out);
 }
 
@@ -110,19 +110,14 @@ static void _handlePomoConfig(const String &id, JsonDocument &d, Preferences &pr
 
 static void _handlePomoCmd(const String &id, JsonDocument &d) {
     const char *cmd = d["data"]["cmd"] | "";
-    if (strcmp(cmd, "start") == 0) {
-        g_pomoTimer.running  = true;
-        g_pomoTimer.lastTick = millis();
-    } else if (strcmp(cmd, "pause") == 0) {
+    if      (strcmp(cmd, "start") == 0) { g_pomoTimer.running = true; g_pomoTimer.lastTick = millis(); }
+    else if (strcmp(cmd, "pause") == 0) { g_pomoTimer.running = false; }
+    else if (strcmp(cmd, "reset") == 0) {
         g_pomoTimer.running = false;
-    } else if (strcmp(cmd, "reset") == 0) {
-        g_pomoTimer.running           = false;
-        g_pomoTimer.phase             = POMO_WORK;
-        g_pomoTimer.secondsRemaining  = g_pomoCfg.workMinutes * 60;
+        g_pomoTimer.phase = POMO_WORK;
+        g_pomoTimer.secondsRemaining = g_pomoCfg.workMinutes * 60;
         g_pomoTimer.sessionsCompleted = 0;
-    } else {
-        _replyErr(id, "unknown cmd"); return;
-    }
+    } else { _replyErr(id, "unknown cmd"); return; }
     _replyOk(id);
 }
 
@@ -138,79 +133,58 @@ static void _handleSpotifyState(const String &id, JsonDocument &d) {
     _replyOk(id);
 }
 
-// ── GIF upload (chunked base64) ───────────────────────────────────────────
+// ── GIF upload ────────────────────────────────────────────────────────────
 
 static void _handleGifStart(const String &id, JsonDocument &d) {
     const char *filename = d["data"]["filename"] | "";
     if (strlen(filename) == 0) { _replyErr(id, "missing filename"); return; }
     if (_gifOpen) { _gifFile.close(); _gifOpen = false; }
-
-    _gifPath  = String("/gifs/") + filename;
+    _gifPath = String("/gifs/") + filename;
     _gifTotal = d["data"]["totalBytes"] | 0;
     _gifReceived = 0;
-
     if (!SPIFFS.exists("/gifs")) SPIFFS.mkdir("/gifs");
     _gifFile = SPIFFS.open(_gifPath, FILE_WRITE);
     if (!_gifFile) { _replyErr(id, "SPIFFS open failed"); return; }
     _gifOpen = true;
-    Serial.printf("[USB] GIF upload start: %s (%u bytes)\n",
-                  _gifPath.c_str(), _gifTotal);
     _replyOk(id, "{\"ready\":true}");
 }
 
 static void _handleGifChunk(const String &id, JsonDocument &d) {
-    if (!_gifOpen) { _replyErr(id, "no upload in progress — send gif_start first"); return; }
-
+    if (!_gifOpen) { _replyErr(id, "no upload in progress"); return; }
     const char *b64 = d["data"]["data"] | "";
     bool isFinal    = d["data"]["final"] | false;
     int  chunkIndex = d["data"]["index"] | -1;
 
-    // Decode base64 chunk
-    // We use a simple local decoder to avoid adding a library dependency.
-    // ArduinoJson's base64 support was removed in v7; do it manually.
     const char b64chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     auto b64val = [&](char c) -> int {
-        const char *p = strchr(b64chars, c);
-        return p ? (int)(p - b64chars) : -1;
+        const char *p = strchr(b64chars, c); return p ? (int)(p - b64chars) : -1;
     };
-
     size_t srcLen = strlen(b64);
-    // Output buffer: decoded bytes can be at most 3/4 of base64 length
     size_t maxOut = (srcLen / 4) * 3 + 3;
     uint8_t *buf = new uint8_t[maxOut];
     size_t outLen = 0;
-
     for (size_t i = 0; i + 3 < srcLen; i += 4) {
-        int v0 = b64val(b64[i]);
-        int v1 = b64val(b64[i+1]);
-        int v2 = b64[i+2] == '=' ? 0 : b64val(b64[i+2]);
-        int v3 = b64[i+3] == '=' ? 0 : b64val(b64[i+3]);
+        int v0 = b64val(b64[i]), v1 = b64val(b64[i+1]);
+        int v2 = b64[i+2]=='='? 0 : b64val(b64[i+2]);
+        int v3 = b64[i+3]=='='? 0 : b64val(b64[i+3]);
         if (v0 < 0 || v1 < 0) break;
-        buf[outLen++] = (uint8_t)((v0 << 2) | (v1 >> 4));
-        if (b64[i+2] != '=') buf[outLen++] = (uint8_t)((v1 << 4) | (v2 >> 2));
-        if (b64[i+3] != '=') buf[outLen++] = (uint8_t)((v2 << 6) | v3);
+        buf[outLen++] = (uint8_t)((v0<<2)|(v1>>4));
+        if (b64[i+2]!='=') buf[outLen++] = (uint8_t)((v1<<4)|(v2>>2));
+        if (b64[i+3]!='=') buf[outLen++] = (uint8_t)((v2<<6)|v3);
     }
-
     size_t written = _gifFile.write(buf, outLen);
     delete[] buf;
     _gifReceived += written;
-
     if (written != outLen) {
-        _gifFile.close();
-        _gifOpen = false;
-        _replyErr(id, "SPIFFS write failed — disk full?");
-        return;
+        _gifFile.close(); _gifOpen = false;
+        _replyErr(id, "SPIFFS write failed"); return;
     }
-
     if (isFinal) {
-        _gifFile.close();
-        _gifOpen = false;
-        Serial.printf("[USB] GIF upload done: %u bytes written\n", _gifReceived);
+        _gifFile.close(); _gifOpen = false;
         _replyOk(id, "{\"done\":true,\"bytes\":" + String(_gifReceived) + "}");
     } else {
-        _replyOk(id, "{\"chunk\":" + String(chunkIndex) + ",\"received\":" +
-                      String(_gifReceived) + "}");
+        _replyOk(id, "{\"chunk\":" + String(chunkIndex) + ",\"received\":" + String(_gifReceived) + "}");
     }
 }
 
@@ -239,8 +213,7 @@ static void _handleGifList(const String &id) {
             f = root.openNextFile();
         }
     }
-    String out;
-    serializeJson(doc, out);
+    String out; serializeJson(doc, out);
     _replyOk(id, out);
 }
 
@@ -252,41 +225,72 @@ static void _handleGifDelete(const String &id, JsonDocument &d) {
     _replyOk(id);
 }
 
-// ── WiFi commands (keep backwards compat with provisioning) ───────────────
+// ── WiFi — NON-BLOCKING ────────────────────────────────────────────────────
+// OLD: had delay(200) loop for up to 15s → blocked usb_api_loop() entirely
+//      → any command sent during connect would time out
+// NEW: start WiFi and return immediately; check connection in _poll_wifi()
+//      called from usb_api_loop() every iteration
 
 static void _handleWifi(const String &id, JsonDocument &d, Preferences &prefs) {
-    // Legacy path handled by wifi_manager; here we just surface an error
-    // if WiFi was already configured via the old protocol.
-    // The wifi_manager serial loop reads raw lines starting with '{' —
-    // the USB API intercepts before wifi_manager, so we handle it here.
-    const char *ssid = d["data"]["ssid"] | "";
-    const char *pass = d["data"]["password"] | "";
+    if (_wifiConnecting) {
+        _replyErr(id, "wifi connect already in progress");
+        return;
+    }
+
+    // Accept ssid from BOTH d["data"]["ssid"] (new format) and d["ssid"] (old format)
+    const char *ssid = "";
+    const char *pass = "";
+    if (!d["data"]["ssid"].isNull()) {
+        ssid = d["data"]["ssid"] | "";
+        pass = d["data"]["password"] | "";
+    } else if (!d["ssid"].isNull()) {
+        // Legacy format fallback
+        ssid = d["ssid"] | "";
+        pass = d["password"] | "";
+    }
+
     if (strlen(ssid) == 0) { _replyErr(id, "missing ssid"); return; }
+
     prefs.putString(PREF_SSID, ssid);
     prefs.putString(PREF_PASS, pass);
-    // Actual connection is triggered by wifi_manager on next boot or reconnect.
-    // For immediate connect we call WiFi directly:
+
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, pass);
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-        delay(200);
-    }
+
+    // Don't block — record state and return. _poll_wifi() in usb_api_loop()
+    // will check WiFi.status() each loop iteration and send the response.
+    _wifiConnecting   = true;
+    _wifiPendingId    = id;
+    _wifiConnectStart = millis();
+
+    Serial.printf("[USB] WiFi connecting to: %s (async)\n", ssid);
+    // No reply yet — will be sent by _poll_wifi() when connected or timed out
+}
+
+static void _poll_wifi() {
+    if (!_wifiConnecting) return;
+
     if (WiFi.status() == WL_CONNECTED) {
         String ip = WiFi.localIP().toString();
-        wifi_set_connected(ip);          // update wifi_manager state
-        _replyOk(id, "{\"ip\":\"" + ip + "\"}");
-        // Also emit legacy "IP:" line so Flutter provisioning flow still works
+        wifi_set_connected(ip);
+        _wifiConnecting = false;
+        // New JSON response
+        _replyOk(_wifiPendingId, "{\"ip\":\"" + ip + "\"}");
+        // Legacy "IP:" line for setup_screen.dart requestDeviceIp()
         Serial.printf("IP:%s\n", ip.c_str());
-    } else {
-        _replyErr(id, "wifi_connect_failed");
+        Serial.printf("[USB] WiFi connected: %s\n", ip.c_str());
+    } else if (millis() - _wifiConnectStart > WIFI_ASYNC_TIMEOUT) {
+        _wifiConnecting = false;
+        WiFi.disconnect();
+        _replyErr(_wifiPendingId, "wifi_connect_failed");
+        Serial.println("[USB] WiFi connect timeout");
     }
+    // Otherwise: still connecting, try again next loop iteration
 }
 
 static void _handleGetIp(const String &id) {
     if (wifi_connected()) {
         _replyOk(id, "{\"ip\":\"" + wifi_ip() + "\"}");
-        // Legacy compat
         Serial.printf("IP:%s\n", wifi_ip().c_str());
     } else {
         _replyErr(id, "not_connected");
@@ -296,68 +300,58 @@ static void _handleGetIp(const String &id) {
 // ── Dispatch ──────────────────────────────────────────────────────────────
 
 static void _dispatch(const String &line, Preferences &prefs) {
-    // Fast bail — must start with '{' to be a command
     if (line.length() < 2 || line[0] != '{') return;
 
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, line);
-    if (err != DeserializationError::Ok) {
-        // Might be legacy "IP:" or other raw serial — ignore silently
-        return;
-    }
+    if (deserializeJson(doc, line) != DeserializationError::Ok) return;
 
     const char *id  = doc["id"]  | "";
     const char *cmd = doc["cmd"] | "";
+    if (strlen(cmd) == 0) return;
 
-    if (strlen(cmd) == 0) return; // not a command packet
-
-    if      (strcmp(cmd, "ping")          == 0) _handlePing(id, doc);
-    else if (strcmp(cmd, "status")        == 0) _handleStatus(id, doc);
-    else if (strcmp(cmd, "set_mode")      == 0) _handleSetMode(id, doc, prefs);
-    else if (strcmp(cmd, "set_brightness")== 0) _handleSetBrightness(id, doc, prefs);
-    else if (strcmp(cmd, "clock_config")  == 0) _handleClockConfig(id, doc, prefs);
-    else if (strcmp(cmd, "pomo_config")   == 0) _handlePomoConfig(id, doc, prefs);
-    else if (strcmp(cmd, "pomo_cmd")      == 0) _handlePomoCmd(id, doc);
-    else if (strcmp(cmd, "spotify_state") == 0) _handleSpotifyState(id, doc);
-    else if (strcmp(cmd, "gif_start")     == 0) _handleGifStart(id, doc);
-    else if (strcmp(cmd, "gif_chunk")     == 0) _handleGifChunk(id, doc);
-    else if (strcmp(cmd, "gif_select")    == 0) _handleGifSelect(id, doc, prefs);
-    else if (strcmp(cmd, "gif_list")      == 0) _handleGifList(id);
-    else if (strcmp(cmd, "gif_delete")    == 0) _handleGifDelete(id, doc);
-    else if (strcmp(cmd, "wifi")          == 0) _handleWifi(id, doc, prefs);
-    else if (strcmp(cmd, "get_ip")        == 0) _handleGetIp(id);
-    else {
-        _reply(id, false, "", String("unknown command: ") + cmd);
-    }
+    if      (strcmp(cmd, "ping")           == 0) _handlePing(id, doc);
+    else if (strcmp(cmd, "status")         == 0) _handleStatus(id, doc);
+    else if (strcmp(cmd, "set_mode")       == 0) _handleSetMode(id, doc, prefs);
+    else if (strcmp(cmd, "set_brightness") == 0) _handleSetBrightness(id, doc, prefs);
+    else if (strcmp(cmd, "clock_config")   == 0) _handleClockConfig(id, doc, prefs);
+    else if (strcmp(cmd, "pomo_config")    == 0) _handlePomoConfig(id, doc, prefs);
+    else if (strcmp(cmd, "pomo_cmd")       == 0) _handlePomoCmd(id, doc);
+    else if (strcmp(cmd, "spotify_state")  == 0) _handleSpotifyState(id, doc);
+    else if (strcmp(cmd, "gif_start")      == 0) _handleGifStart(id, doc);
+    else if (strcmp(cmd, "gif_chunk")      == 0) _handleGifChunk(id, doc);
+    else if (strcmp(cmd, "gif_select")     == 0) _handleGifSelect(id, doc, prefs);
+    else if (strcmp(cmd, "gif_list")       == 0) _handleGifList(id);
+    else if (strcmp(cmd, "gif_delete")     == 0) _handleGifDelete(id, doc);
+    else if (strcmp(cmd, "wifi")           == 0) _handleWifi(id, doc, prefs);
+    else if (strcmp(cmd, "get_ip")         == 0) _handleGetIp(id);
+    else _reply(id, false, "", String("unknown command: ") + cmd);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
 
 void usb_api_init(Preferences &prefs) {
-    _buf.reserve(2048); // reserve for chunked GIF data
+    _buf.reserve(2048);
     Serial.printf("[USB] API ready — baud %d\n", SERIAL_BAUD);
 }
 
 void usb_api_loop(Preferences &prefs) {
+    // Check async WiFi connect state first (non-blocking)
+    _poll_wifi();
+
+    // Drain serial and dispatch commands
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n') {
             _buf.trim();
-            if (_buf.length() > 0) {
-                _dispatch(_buf, prefs);
-            }
+            if (_buf.length() > 0) _dispatch(_buf, prefs);
             _buf = "";
         } else {
-            // Guard against absurdly large packets (malformed data)
             if (_buf.length() < 65535) _buf += c;
         }
     }
 }
 
 void usb_push(const String &event, const String &jsonData) {
-    // Only write if USB host is connected (DTR line asserted)
-    // On ESP32-S3 with native CDC, Serial is always "connected" once boot finishes.
-    // This is a best-effort send.
     String out = "{\"push\":\"" + event + "\",\"data\":" + jsonData + "}\n";
     Serial.print(out);
 }
