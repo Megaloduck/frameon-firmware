@@ -1,5 +1,5 @@
 /*
- * Frameon Firmware v1.0
+ * Frameon Firmware v1.1
  * ESP32-S3-N16R8  ·  P4-2121-64×32 HUB75E
  *
  * Receives pre-rendered RGB565 frame packets from the Frameon desktop app
@@ -40,7 +40,15 @@
  *   0x15 NAK — CRC mismatch
  *   0x1B ERR — malformed header / unsupported dimensions
  *
- * IMPORTANT — response byte ordering rule:
+ * FIX v1.1 — Serial.flush() after every Serial.write() response byte
+ * ────────────────────────────────────────────────────────────────────
+ *   ESP32-S3 native USB CDC (TinyUSB) buffers outgoing data and waits to
+ *   fill a 64-byte USB packet before transmitting. A single-byte response
+ *   (ACK/NAK/ERR) would sit in the TinyUSB TX buffer indefinitely without
+ *   an explicit flush, causing the Frameon app to time out after 15 s with
+ *   "No response from device". Serial.flush() forces immediate transmission.
+ *
+ * Response byte ordering rule (unchanged from v1.0):
  *   Serial.printf() (debug text) must always be sent BEFORE Serial.write()
  *   (the response byte). Flutter's readResponseByte() polls for the first
  *   available byte; if debug text arrives first it reads '[' (0x5B) instead
@@ -133,7 +141,7 @@ static void renderFrame(int bufIdx, int frameIdx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Waiting screen
+// Waiting screen — shown on Core 0 when no animation is loaded
 // ─────────────────────────────────────────────────────────────────────────────
 static void showWaitingScreen(uint32_t elapsedMs) {
     matrix->clearScreen();
@@ -149,6 +157,7 @@ static void showWaitingScreen(uint32_t elapsedMs) {
     matrix->setCursor(3, 19);
     matrix->print("READY");
 
+    // Blink a dot every 500 ms to show the firmware is alive
     bool dotOn = (elapsedMs / 500) % 2 == 0;
     if (dotOn) {
         matrix->fillCircle(57, 22, 2, matrix->color565(33, 195, 44));
@@ -160,7 +169,12 @@ static void showWaitingScreen(uint32_t elapsedMs) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Display task — core 0
+// Display task — Core 0
+//
+// Continuously renders the active frame buffer to the LED matrix.
+// Reads activeBuf / activeFrameCount / activeFrameDurMs under the swap mutex
+// so it always sees a consistent snapshot even if Core 1 swaps buffers
+// mid-render.
 // ─────────────────────────────────────────────────────────────────────────────
 static void displayTask(void* /*param*/) {
     int      currentFrame = 0;
@@ -195,7 +209,7 @@ static void displayTask(void* /*param*/) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// parseHeader
+// parseHeader — extract fields from the 16-byte header in pktBuf[pendingBuf]
 // ─────────────────────────────────────────────────────────────────────────────
 static void parseHeader() {
     const uint8_t* h = pktBuf[pendingBuf];
@@ -210,49 +224,63 @@ static void parseHeader() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processPacket
+// processPacket — validate CRC + dimensions, commit buffer, send response
 //
-// FIX: Serial.printf() (debug text) is sent BEFORE Serial.write() (response
-// byte) in every branch.  This guarantees the response byte is always the
-// LAST — and freshest — byte in the OS serial buffer when Flutter polls.
+// FIX v1.1: Serial.flush() is called after every Serial.write() response byte.
+//
+// Why: ESP32-S3 native USB CDC uses TinyUSB internally. TinyUSB accumulates
+// outgoing bytes in a 64-byte endpoint buffer and only transmits when the
+// buffer is full OR an explicit flush is requested. A single-byte ACK/NAK/ERR
+// would never reach the host on its own — it would sit in TinyUSB's TX buffer
+// until more data arrived. Serial.flush() forces an immediate USB bulk transfer
+// so the Frameon app receives the response byte within milliseconds instead of
+// timing out after 15 s.
+//
+// Rule: Serial.printf() debug text BEFORE Serial.write() response byte,
+// then Serial.flush() to push the byte to the host immediately.
 // ─────────────────────────────────────────────────────────────────────────────
 static void processPacket() {
     const uint32_t headerAndPayload = HEADER_SIZE + pktPayloadBytes;
 
-    // ── CRC ───────────────────────────────────────────────────────────────
+    // ── CRC validation ────────────────────────────────────────────────────
     const uint16_t storedCrc =
         ((uint16_t)pktBuf[pendingBuf][headerAndPayload] << 8)
         | pktBuf[pendingBuf][headerAndPayload + 1];
     const uint16_t computedCrc = crc16(pktBuf[pendingBuf], headerAndPayload);
 
     if (storedCrc != computedCrc) {
-        // printf FIRST — then the single response byte.
         Serial.printf("[NAK] CRC fail — stored=0x%04X computed=0x%04X\n",
                       storedCrc, computedCrc);
         Serial.write(RESP_NAK);
+        Serial.flush(); // FIX: force TinyUSB to transmit the NAK byte immediately
         return;
     }
 
-    // ── Dimension & size validation ───────────────────────────────────────
+    // ── Dimension validation ──────────────────────────────────────────────
     const uint32_t expectedPayload = (uint32_t)pktFrameCount * FRAME_BYTES;
 
     if (pktWidth != PANEL_WIDTH || pktHeight != REAL_HEIGHT) {
         Serial.printf("[ERR] Wrong dimensions: %dx%d (expected %dx%d)\n",
                       pktWidth, pktHeight, PANEL_WIDTH, REAL_HEIGHT);
         Serial.write(RESP_ERR);
+        Serial.flush(); // FIX: force TinyUSB to transmit the ERR byte immediately
         return;
     }
+
     if (pktFrameCount == 0 || pktFrameCount > MAX_FRAMES) {
         Serial.printf("[ERR] Frame count out of range: %d (max %d)\n",
                       pktFrameCount, MAX_FRAMES);
         Serial.write(RESP_ERR);
+        Serial.flush(); // FIX: force TinyUSB to transmit the ERR byte immediately
         return;
     }
+
     if (pktPayloadBytes != expectedPayload) {
         Serial.printf("[ERR] Payload size mismatch: got %lu expected %lu\n",
                       (unsigned long)pktPayloadBytes,
                       (unsigned long)expectedPayload);
         Serial.write(RESP_ERR);
+        Serial.flush(); // FIX: force TinyUSB to transmit the ERR byte immediately
         return;
     }
 
@@ -265,22 +293,28 @@ static void processPacket() {
 
     pendingBuf = 1 - pendingBuf;
 
-    // ── ACK — printf FIRST, then the response byte ────────────────────────
+    // ── ACK — debug text FIRST, then response byte, then flush ────────────
     Serial.printf("[ACK] %d frames @ %d ms/frame (%.1f fps)  %.1f KB payload\n",
                   pktFrameCount,
                   pktDurMs,
                   pktDurMs > 0 ? 1000.0f / pktDurMs : 0.0f,
                   pktPayloadBytes / 1024.0f);
     Serial.write(RESP_ACK);
+    Serial.flush(); // FIX: force TinyUSB to transmit the ACK byte immediately
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processSerial — serial receive state machine
+// processSerial — serial receive state machine, called from loop()
+//
+// Runs entirely on Core 1. Reads available bytes from the USB CDC Serial
+// buffer and advances through the packet receive states one chunk at a time.
+// When a complete packet is assembled (magic + header + payload + CRC),
+// calls processPacket() to validate and commit it.
 // ─────────────────────────────────────────────────────────────────────────────
 static void processSerial() {
     uint8_t* buf = pktBuf[pendingBuf];
 
-    // ── RX_IDLE: scan for "FRM" ───────────────────────────────────────────
+    // ── RX_IDLE: scan for "FRM" magic ─────────────────────────────────────
     while (rxState == RX_IDLE && Serial.available()) {
         const uint8_t b = (uint8_t)Serial.read();
         syncBuf[0] = syncBuf[1];
@@ -305,8 +339,8 @@ static void processSerial() {
         const size_t needed = HEADER_SIZE - rxIdx;
         const size_t avail  = (size_t)Serial.available();
         const size_t toRead = (needed < avail) ? needed : avail;
-        const size_t got    = Serial.readBytes((char*)buf + rxIdx, toRead);
-        rxIdx += (uint32_t)got;
+        Serial.readBytes((char*)buf + rxIdx, toRead);
+        rxIdx += (uint32_t)toRead;
 
         if (rxIdx == HEADER_SIZE) {
             parseHeader();
@@ -324,6 +358,7 @@ static void processSerial() {
                               pktWidth, pktHeight, pktFrameCount,
                               (unsigned long)pktPayloadBytes);
                 Serial.write(RESP_ERR);
+                Serial.flush(); // FIX: force TinyUSB to transmit the ERR byte immediately
                 rxState = RX_IDLE;
                 rxIdx   = 0;
             } else {
@@ -373,8 +408,9 @@ void setup() {
     Serial.begin(115200);
     Serial.setTimeout(0);
     delay(500);
+
     Serial.println("\n╔══════════════════════════════════════╗");
-    Serial.println("║  Frameon Firmware v1.0               ║");
+    Serial.println("║  Frameon Firmware v1.1               ║");
     Serial.println("║  ESP32-S3-N16R8  ·  HUB75E 64×32     ║");
     Serial.println("╚══════════════════════════════════════╝");
 
@@ -436,7 +472,7 @@ void setup() {
     matrix->flipDMABuffer();
     Serial.println("Matrix OK.");
 
-    // ── Spawn display task on core 0 ─────────────────────────────────────
+    // ── Spawn display task on Core 0 ──────────────────────────────────────
     xTaskCreatePinnedToCore(
         displayTask,
         "display",
@@ -460,9 +496,9 @@ void setup() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// loop
+// loop — Core 1
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
     processSerial();
-    vTaskDelay(1);
+    vTaskDelay(1); // yield to FreeRTOS scheduler; keeps watchdog happy
 }
