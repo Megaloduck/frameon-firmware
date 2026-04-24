@@ -39,6 +39,12 @@
  *   0x06 ACK — valid packet committed
  *   0x15 NAK — CRC mismatch
  *   0x1B ERR — malformed header / unsupported dimensions
+ *
+ * IMPORTANT — response byte ordering rule:
+ *   Serial.printf() (debug text) must always be sent BEFORE Serial.write()
+ *   (the response byte). Flutter's readResponseByte() polls for the first
+ *   available byte; if debug text arrives first it reads '[' (0x5B) instead
+ *   of the ACK/NAK/ERR byte and throws "Unexpected response byte: 0x5B".
  */
 
 #include <Arduino.h>
@@ -52,12 +58,6 @@ static MatrixPanel_I2S_DMA* matrix = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PSRAM double-buffer
-//
-// Two packet-sized buffers sit in PSRAM.
-// activeBuf   → being rendered by displayTask (core 0)
-// pendingBuf  → being filled by the serial receiver (core 1)
-// On a successful receive, pendingBuf becomes the new activeBuf atomically
-// under swapMutex, then the roles swap.
 // ─────────────────────────────────────────────────────────────────────────────
 static uint8_t*          pktBuf[2]          = {nullptr, nullptr};
 static volatile int      activeBuf          = 0;
@@ -71,18 +71,17 @@ static SemaphoreHandle_t swapMutex          = nullptr;
 // Serial receive state machine
 // ─────────────────────────────────────────────────────────────────────────────
 enum RxState : uint8_t {
-    RX_IDLE,     // scanning for "FRM" magic
-    RX_HEADER,   // reading header bytes [3-15]
-    RX_PAYLOAD,  // streaming pixel data
-    RX_CRC_H,    // reading CRC high byte
-    RX_CRC_L,    // reading CRC low byte
+    RX_IDLE,
+    RX_HEADER,
+    RX_PAYLOAD,
+    RX_CRC_H,
+    RX_CRC_L,
 };
 
 static RxState   rxState       = RX_IDLE;
 static uint32_t  rxIdx         = 0;
-static uint8_t   syncBuf[3]    = {0, 0, 0};  // sliding window for magic detection
+static uint8_t   syncBuf[3]    = {0, 0, 0};
 
-// Parsed header fields (populated by parseHeader()):
 static uint16_t  pktFrameCount   = 0;
 static uint16_t  pktWidth        = 0;
 static uint16_t  pktHeight       = 0;
@@ -103,7 +102,6 @@ static void     displayTask(void* param);
 // ─────────────────────────────────────────────────────────────────────────────
 // CRC-16/CCITT
 // Poly: 0x1021   Init: 0xFFFF
-// Must match Frameon's FrameExporter._crc16 (frame_exporter.dart).
 // ─────────────────────────────────────────────────────────────────────────────
 static uint16_t crc16(const uint8_t* data, size_t len) {
     uint16_t crc = 0xFFFF;
@@ -118,16 +116,6 @@ static uint16_t crc16(const uint8_t* data, size_t len) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Render one frame to the matrix
-//
-// Frame pixel data resides at:
-//   pktBuf[bufIdx] + HEADER_SIZE + frameIdx * FRAME_BYTES
-//
-// Pixels are RGB565, big-endian, row-major (left-to-right, top-to-bottom).
-// Only physical rows 0..(REAL_HEIGHT-1) are drawn; the virtual lower half
-// (rows 32-63) is left black so the E-pin addressing produces no artefacts.
-//
-// double_buff = true → we write into the back buffer then flip, giving
-// tear-free animation at the cost of one frame of latency.
 // ─────────────────────────────────────────────────────────────────────────────
 static void renderFrame(int bufIdx, int frameIdx) {
     const uint8_t* src = pktBuf[bufIdx]
@@ -136,7 +124,7 @@ static void renderFrame(int bufIdx, int frameIdx) {
 
     for (int y = 0; y < REAL_HEIGHT; y++) {
         for (int x = 0; x < PANEL_WIDTH; x++) {
-            const int     i     = y * PANEL_WIDTH + x;
+            const int      i     = y * PANEL_WIDTH + x;
             const uint16_t color = ((uint16_t)src[i * 2] << 8) | src[i * 2 + 1];
             matrix->drawPixel(x, y, color);
         }
@@ -145,27 +133,22 @@ static void renderFrame(int bufIdx, int frameIdx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Waiting screen — displayed when no packet has been received yet.
-// Shows a minimal Frameon brand mark and a pulsing dot.
+// Waiting screen
 // ─────────────────────────────────────────────────────────────────────────────
 static void showWaitingScreen(uint32_t elapsedMs) {
     matrix->clearScreen();
 
-    // ── "FRAMEON" — LED green, top-left ──────────────────────────────────
     matrix->setTextSize(1);
     matrix->setTextColor(matrix->color565(33, 195, 44));
     matrix->setCursor(3, 3);
     matrix->print("FRAMEON");
 
-    // ── Thin green underline ──────────────────────────────────────────────
     matrix->drawFastHLine(3, 12, 43, matrix->color565(15, 60, 18));
 
-    // ── "READY" in dim grey ───────────────────────────────────────────────
     matrix->setTextColor(matrix->color565(45, 45, 45));
     matrix->setCursor(3, 19);
     matrix->print("READY");
 
-    // ── Pulsing dot (500 ms period) ───────────────────────────────────────
     bool dotOn = (elapsedMs / 500) % 2 == 0;
     if (dotOn) {
         matrix->fillCircle(57, 22, 2, matrix->color565(33, 195, 44));
@@ -178,18 +161,12 @@ static void showWaitingScreen(uint32_t elapsedMs) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Display task — core 0
-//
-// Loops through the active frame buffer, rendering one frame per
-// activeFrameDurMs.  When no frames are loaded, shows the waiting screen.
-// The swapMutex is held only for the brief snapshot of volatile state —
-// the actual rendering (ms-scale) runs without the mutex.
 // ─────────────────────────────────────────────────────────────────────────────
 static void displayTask(void* /*param*/) {
     int      currentFrame = 0;
     uint32_t taskStart    = millis();
 
     while (true) {
-        // Snapshot volatile shared state
         xSemaphoreTake(swapMutex, portMAX_DELAY);
         const int      buf   = activeBuf;
         const int      count = activeFrameCount;
@@ -204,7 +181,7 @@ static void displayTask(void* /*param*/) {
 
         if (currentFrame >= count) currentFrame = 0;
 
-        const uint32_t t0 = millis();
+        const uint32_t t0      = millis();
         renderFrame(buf, currentFrame);
         const uint32_t elapsed = millis() - t0;
 
@@ -218,13 +195,10 @@ static void displayTask(void* /*param*/) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// parseHeader — extract fields from pktBuf[pendingBuf][0..15]
-// Called after exactly HEADER_SIZE bytes have been received.
+// parseHeader
 // ─────────────────────────────────────────────────────────────────────────────
 static void parseHeader() {
     const uint8_t* h = pktBuf[pendingBuf];
-    // h[0-2] = magic (already verified)
-    // h[3]   = version (accepted as-is for forward compat)
     pktFrameCount   = ((uint16_t)h[4]  << 8) | h[5];
     pktWidth        = ((uint16_t)h[6]  << 8) | h[7];
     pktHeight       = ((uint16_t)h[8]  << 8) | h[9];
@@ -236,9 +210,11 @@ static void parseHeader() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processPacket — validate CRC, check dimensions, commit to active buffer.
-// Called after all bytes (header + payload + CRC) have been received into
-// pktBuf[pendingBuf].
+// processPacket
+//
+// FIX: Serial.printf() (debug text) is sent BEFORE Serial.write() (response
+// byte) in every branch.  This guarantees the response byte is always the
+// LAST — and freshest — byte in the OS serial buffer when Flutter polls.
 // ─────────────────────────────────────────────────────────────────────────────
 static void processPacket() {
     const uint32_t headerAndPayload = HEADER_SIZE + pktPayloadBytes;
@@ -250,9 +226,10 @@ static void processPacket() {
     const uint16_t computedCrc = crc16(pktBuf[pendingBuf], headerAndPayload);
 
     if (storedCrc != computedCrc) {
-        Serial.write(RESP_NAK);
+        // printf FIRST — then the single response byte.
         Serial.printf("[NAK] CRC fail — stored=0x%04X computed=0x%04X\n",
                       storedCrc, computedCrc);
+        Serial.write(RESP_NAK);
         return;
     }
 
@@ -260,22 +237,22 @@ static void processPacket() {
     const uint32_t expectedPayload = (uint32_t)pktFrameCount * FRAME_BYTES;
 
     if (pktWidth != PANEL_WIDTH || pktHeight != REAL_HEIGHT) {
-        Serial.write(RESP_ERR);
         Serial.printf("[ERR] Wrong dimensions: %dx%d (expected %dx%d)\n",
                       pktWidth, pktHeight, PANEL_WIDTH, REAL_HEIGHT);
+        Serial.write(RESP_ERR);
         return;
     }
     if (pktFrameCount == 0 || pktFrameCount > MAX_FRAMES) {
-        Serial.write(RESP_ERR);
         Serial.printf("[ERR] Frame count out of range: %d (max %d)\n",
                       pktFrameCount, MAX_FRAMES);
+        Serial.write(RESP_ERR);
         return;
     }
     if (pktPayloadBytes != expectedPayload) {
-        Serial.write(RESP_ERR);
         Serial.printf("[ERR] Payload size mismatch: got %lu expected %lu\n",
                       (unsigned long)pktPayloadBytes,
                       (unsigned long)expectedPayload);
+        Serial.write(RESP_ERR);
         return;
     }
 
@@ -286,40 +263,24 @@ static void processPacket() {
     activeFrameDurMs = (pktDurMs > 0) ? pktDurMs : 100;
     xSemaphoreGive(swapMutex);
 
-    pendingBuf = 1 - pendingBuf;  // next receive goes to the other buffer
+    pendingBuf = 1 - pendingBuf;
 
-    // ── ACK ───────────────────────────────────────────────────────────────
-    Serial.write(RESP_ACK);
+    // ── ACK — printf FIRST, then the response byte ────────────────────────
     Serial.printf("[ACK] %d frames @ %d ms/frame (%.1f fps)  %.1f KB payload\n",
                   pktFrameCount,
                   pktDurMs,
                   pktDurMs > 0 ? 1000.0f / pktDurMs : 0.0f,
                   pktPayloadBytes / 1024.0f);
+    Serial.write(RESP_ACK);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processSerial — serial receive state machine, called every loop() tick.
-//
-// State transitions:
-//
-//   RX_IDLE    sliding-window scan for the 3-byte "FRM" magic sequence.
-//              On match, writes magic into pktBuf[pendingBuf][0-2] and
-//              advances to RX_HEADER.
-//
-//   RX_HEADER  reads header bytes [3-15] (13 bytes).
-//              On complete, calls parseHeader() and validates the fields.
-//              Aborts (→ IDLE + RESP_ERR) if dimensions or sizes are wrong.
-//
-//   RX_PAYLOAD bulk-reads pixel data directly into pktBuf[pendingBuf].
-//              Uses Serial.readBytes() for efficiency on large payloads.
-//
-//   RX_CRC_H   reads CRC high byte.
-//   RX_CRC_L   reads CRC low byte, then calls processPacket().
+// processSerial — serial receive state machine
 // ─────────────────────────────────────────────────────────────────────────────
 static void processSerial() {
     uint8_t* buf = pktBuf[pendingBuf];
 
-    // ── RX_IDLE: scan for "FRM" using a 3-byte sliding window ────────────
+    // ── RX_IDLE: scan for "FRM" ───────────────────────────────────────────
     while (rxState == RX_IDLE && Serial.available()) {
         const uint8_t b = (uint8_t)Serial.read();
         syncBuf[0] = syncBuf[1];
@@ -332,14 +293,14 @@ static void processSerial() {
             buf[0] = FRM_MAGIC_0;
             buf[1] = FRM_MAGIC_1;
             buf[2] = FRM_MAGIC_2;
-            rxIdx  = 3;
+            rxIdx   = 3;
             rxState = RX_HEADER;
             memset(syncBuf, 0, sizeof(syncBuf));
             Serial.println("[RX]  Magic found — reading header...");
         }
     }
 
-    // ── RX_HEADER: read bytes [3..15] ────────────────────────────────────
+    // ── RX_HEADER ─────────────────────────────────────────────────────────
     if (rxState == RX_HEADER && Serial.available()) {
         const size_t needed = HEADER_SIZE - rxIdx;
         const size_t avail  = (size_t)Serial.available();
@@ -359,10 +320,10 @@ static void processSerial() {
                          && (HEADER_SIZE + pktPayloadBytes + CRC_SIZE <= MAX_PACKET);
 
             if (!ok) {
-                Serial.write(RESP_ERR);
                 Serial.printf("[ERR] Header invalid — w=%d h=%d fc=%d pb=%lu\n",
                               pktWidth, pktHeight, pktFrameCount,
                               (unsigned long)pktPayloadBytes);
+                Serial.write(RESP_ERR);
                 rxState = RX_IDLE;
                 rxIdx   = 0;
             } else {
@@ -375,7 +336,7 @@ static void processSerial() {
         }
     }
 
-    // ── RX_PAYLOAD: bulk-read directly into PSRAM buffer ─────────────────
+    // ── RX_PAYLOAD ────────────────────────────────────────────────────────
     if (rxState == RX_PAYLOAD && Serial.available()) {
         const uint32_t payloadEnd = HEADER_SIZE + pktPayloadBytes;
         const uint32_t needed     = payloadEnd - rxIdx;
@@ -410,7 +371,7 @@ static void processSerial() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Serial.setTimeout(0);  // readBytes() returns immediately with available data
+    Serial.setTimeout(0);
     delay(500);
     Serial.println("\n╔══════════════════════════════════════╗");
     Serial.println("║  Frameon Firmware v1.0               ║");
@@ -459,18 +420,14 @@ void setup() {
     mxconfig.gpio.lat = PIN_LAT;
     mxconfig.gpio.oe  = PIN_OE;
 
-    // SHIFTREG: plain shift-register, no FM6126A / ICN2038S init sequence.
-    // PANEL_HEIGHT = 64 (virtual) forces the E address bit to be driven,
-    // which is required for 1/32-scan operation on this panel.
     mxconfig.driver      = HUB75_I2S_CFG::SHIFTREG;
     mxconfig.clkphase    = false;
-    mxconfig.double_buff = true;   // back-buffer rendering → tear-free frames
+    mxconfig.double_buff = true;
 
     matrix = new MatrixPanel_I2S_DMA(mxconfig);
 
     if (!matrix->begin()) {
         Serial.println("FATAL: matrix->begin() failed.");
-        Serial.println("       Check wiring, GPIO assignments, and power supply.");
         while (true) { delay(500); Serial.print('.'); }
     }
 
@@ -481,16 +438,15 @@ void setup() {
 
     // ── Spawn display task on core 0 ─────────────────────────────────────
     xTaskCreatePinnedToCore(
-        displayTask,  // task function
-        "display",    // name
-        8192,         // stack (bytes)
-        nullptr,      // parameter
-        2,            // priority (higher than loop's 1)
-        nullptr,      // handle
-        0             // core 0
+        displayTask,
+        "display",
+        8192,
+        nullptr,
+        2,
+        nullptr,
+        0
     );
 
-    // ── Print ready summary ───────────────────────────────────────────────
     Serial.println("Ready.");
     Serial.println("────────────────────────────────────────");
     Serial.printf( "  Panel:       %dx%d  (virtual %dx%d)\n",
@@ -504,10 +460,7 @@ void setup() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// loop — serial receive only.
-// Display runs independently on core 0 (displayTask).
-// vTaskDelay(1) yields to FreeRTOS scheduler, resets the WDT, and prevents
-// this core from starving other tasks during idle periods.
+// loop
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
     processSerial();
