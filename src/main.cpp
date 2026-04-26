@@ -58,11 +58,13 @@
 #include <Arduino.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include "frameon.h"
+#include "waitingscreen.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Matrix
 // ─────────────────────────────────────────────────────────────────────────────
-static MatrixPanel_I2S_DMA* matrix = nullptr;
+
+MatrixPanel_I2S_DMA* matrix = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PSRAM double-buffer
@@ -101,7 +103,6 @@ static uint32_t  pktPayloadBytes = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 static uint16_t crc16(const uint8_t* data, size_t len);
 static void     renderFrame(int bufIdx, int frameIdx);
-static void     showWaitingScreen(uint32_t elapsedMs);
 static void     parseHeader();
 static void     processPacket();
 static void     processSerial();
@@ -140,33 +141,7 @@ static void renderFrame(int bufIdx, int frameIdx) {
     matrix->flipDMABuffer();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Waiting screen — shown on Core 0 when no animation is loaded
-// ─────────────────────────────────────────────────────────────────────────────
-static void showWaitingScreen(uint32_t elapsedMs) {
-    matrix->clearScreen();
 
-    matrix->setTextSize(1);
-    matrix->setTextColor(matrix->color565(33, 195, 44));
-    matrix->setCursor(3, 3);
-    matrix->print("FRAMEON");
-
-    matrix->drawFastHLine(3, 12, 43, matrix->color565(15, 60, 18));
-
-    matrix->setTextColor(matrix->color565(45, 45, 45));
-    matrix->setCursor(3, 19);
-    matrix->print("READY");
-
-    // Blink a dot every 500 ms to show the firmware is alive
-    bool dotOn = (elapsedMs / 500) % 2 == 0;
-    if (dotOn) {
-        matrix->fillCircle(57, 22, 2, matrix->color565(33, 195, 44));
-    } else {
-        matrix->fillCircle(57, 22, 2, matrix->color565(10, 40, 12));
-    }
-
-    matrix->flipDMABuffer();
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Display task — Core 0
