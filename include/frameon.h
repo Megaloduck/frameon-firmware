@@ -9,8 +9,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ─── GPIO ────────────────────────────────────────────────────────────────────
-// All pins verified safe for ESP32-S3-N16R8
-// (no strapping, no internal flash/PSRAM, no on-board LED conflicts)
 #define PIN_R1    4
 #define PIN_G1    5
 #define PIN_B1   12
@@ -21,54 +19,62 @@
 #define PIN_B    39
 #define PIN_C    40
 #define PIN_D    41
-#define PIN_E    42   // 5th address pin — required for 1/32 scan
+#define PIN_E    42
 #define PIN_CLK   2
 #define PIN_LAT   1
 #define PIN_OE   16
 
 // ─── Panel geometry ──────────────────────────────────────────────────────────
-// The physical panel is 64×32 with 1/32 scan (HUB75E, 5-bit row address).
-// Configuring the library at PANEL_HEIGHT = 64 forces the E address bit to be
-// driven — the standard workaround for 1/32-scan 64×32 panels.
-// Only rows 0..(REAL_HEIGHT-1) contain actual physical pixels.
 #define PANEL_WIDTH    64
-#define PANEL_HEIGHT   64   // virtual — forces E-pin toggling
-#define REAL_HEIGHT    32   // physical pixel rows on the panel
+#define PANEL_HEIGHT   64
+#define REAL_HEIGHT    32
 #define PANEL_CHAIN     1
 
 // ─── Display ─────────────────────────────────────────────────────────────────
-#define DEFAULT_BRIGHTNESS   128   // 0-255; 128 ≈ 50% for comfortable viewing
+#define DEFAULT_BRIGHTNESS   128
 
-// ─── Protocol ────────────────────────────────────────────────────────────────
-// Must exactly match Frameon's FrameExporter (frame_exporter.dart).
+// ─── Protocol v1.4 ───────────────────────────────────────────────────────────
 //
-// Packet layout:
-//   [0-2]   Magic: 0x46 0x52 0x4D ("FRM")
-//   [3]     Version: 0x01
-//   [4-5]   Frame count   (uint16 BE)
-//   [6-7]   Width         (uint16 BE)  — expected 64
-//   [8-9]   Height        (uint16 BE)  — expected 32
-//   [10-11] Duration ms   (uint16 BE)  — uniform across all frames
-//   [12-15] Payload bytes (uint32 BE)  — frame_count × width × height × 2
-//   [16..]  RGB565 pixel data (big-endian, row-major)
-//   [-2..]  CRC-16/CCITT (poly=0x1021, init=0xFFFF) over header + payload
+// Header layout (30 bytes, all multi-byte fields big-endian):
+//
+//   [0-2]   Magic:           0x46 0x52 0x4D  ("FRM")
+//   [3]     Flags:           0x02 = normal commit  |  0x4E = next-song preload
+//   [4-5]   Frame count      (uint16 BE)
+//   [6-7]   Width            (uint16 BE)  — expected 64
+//   [8-9]   Height           (uint16 BE)  — expected 32
+//   [10-11] Duration ms      (uint16 BE)  — per-frame duration
+//   [12-15] Payload bytes    (uint32 BE)
+//   [16-19] startPositionMs  (uint32 BE)  — song position at packet build time
+//   [20-23] trackDurationMs  (uint32 BE)  — total song length (0 = no overdraw)
+//   [24]    barX             (uint8)      — progress bar left edge (px)
+//   [25]    barY             (uint8)      — progress bar top edge (px)
+//   [26]    barW             (uint8)      — progress bar width (px, 0 = no bar)
+//   [27-28] barColor         (uint16 BE)  — filled portion color in RGB565
+//   [29]    _reserved        (uint8)      — pad to 30 bytes, must be 0x00
+//   [30..]  RGB565 pixel data
+//   [-2..]  CRC-16/CCITT over header + payload
+//
+// v1.4 adds barColor (uint16 BE RGB565) so the firmware uses the exact color
+// chosen in the Dart layer settings instead of the hardcoded Spotify green.
+// barColor is computed by the app from layer.progressColor at export time.
 //
 #define FRM_MAGIC_0    0x46   // 'F'
 #define FRM_MAGIC_1    0x52   // 'R'
 #define FRM_MAGIC_2    0x4D   // 'M'
-#define FRM_VERSION    0x01
+#define FRM_VERSION    0x02   // normal commit
+#define FRM_NEXT       0x4E   // 'N' — queue as next-song preload
 
-#define HEADER_SIZE    16     // bytes before the pixel payload
-#define CRC_SIZE        2     // bytes after the pixel payload
+#define HEADER_SIZE    30     // v1.4: was 28, +2 for barColor(uint16) replacing reserved
+#define CRC_SIZE        2
 
-// ─── Serial responses (1 byte) ───────────────────────────────────────────────
-#define RESP_ACK       0x06   // packet accepted, frames committed
-#define RESP_NAK       0x15   // CRC mismatch — resend
-#define RESP_ERR       0x1B   // malformed header / unsupported dimensions
+// ─── Serial responses ────────────────────────────────────────────────────────
+#define RESP_ACK       0x06
+#define RESP_NAK       0x15
+#define RESP_ERR       0x1B
 
 // ─── Buffer limits ───────────────────────────────────────────────────────────
-#define MAX_FRAMES     300                              // matches Flutter cap
-#define FRAME_PIXELS   (PANEL_WIDTH * REAL_HEIGHT)     // 2048 pixels / frame
-#define FRAME_BYTES    (FRAME_PIXELS * 2)              // 4096 bytes  / frame (RGB565)
-#define MAX_PAYLOAD    ((uint32_t)MAX_FRAMES * FRAME_BYTES)    // ≈ 1.2 MB
-#define MAX_PACKET     (HEADER_SIZE + MAX_PAYLOAD + CRC_SIZE)  // ≈ 1.2 MB
+#define MAX_FRAMES     300
+#define FRAME_PIXELS   (PANEL_WIDTH * REAL_HEIGHT)
+#define FRAME_BYTES    (FRAME_PIXELS * 2)
+#define MAX_PAYLOAD    ((uint32_t)MAX_FRAMES * FRAME_BYTES)
+#define MAX_PACKET     (HEADER_SIZE + MAX_PAYLOAD + CRC_SIZE)
