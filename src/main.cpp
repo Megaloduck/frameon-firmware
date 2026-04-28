@@ -27,14 +27,6 @@
 #include "frameon.h"
 #include "waitingscreen.h"
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Panel configuration
-// ─────────────────────────────────────────────────────────────────────────────
-
-#define PANEL_WIDTH  64
-#define PANEL_HEIGHT 64   // physical scan height
-#define REAL_HEIGHT  32   // active pixel rows
-
 MatrixPanel_I2S_DMA* matrix = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,7 +706,7 @@ static void displayTask(void* /*param*/) {
         }
 
         // 4. Single flip — commits all three layers atomically
-        //matrix->flipDMABuffer();
+        matrix->flipDMABuffer();
 
         const uint32_t elapsed    = millis() - t0;
         currentFrame = (currentFrame + 1) % count;
@@ -724,41 +716,82 @@ static void displayTask(void* /*param*/) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// setup / loop
+// setup — Core 1
 // ─────────────────────────────────────────────────────────────────────────────
 
-// (Next-song buffer — static allocation)
 void setup() {
     Serial.begin(921600);
+    delay(200);
+    Serial.println("\n\nFrameon Firmware v1.5");
+    Serial.println("════════════════════════════════════════");
 
-    HUB75_I2S_CFG cfg(PANEL_WIDTH, PANEL_HEIGHT, 1);
-    cfg.gpio.e = 18;
-    cfg.clkphase = false;
-    cfg.driver = HUB75_I2S_CFG::FM6126A;
-    matrix = new MatrixPanel_I2S_DMA(cfg);
-    matrix->begin();
-    matrix->setBrightness8(128);
-    matrix->clearScreen();
-
-    pktBuf[0] = (uint8_t*)ps_malloc(MAX_PACKET);
-    pktBuf[1] = (uint8_t*)ps_malloc(MAX_PACKET);
-    nextBuf   = (uint8_t*)ps_malloc(MAX_PACKET);
-    if (!pktBuf[0] || !pktBuf[1] || !nextBuf) {
-        Serial.println("[ERR] PSRAM allocation failed");
-        while (true) delay(1000);
+    // ── PSRAM allocation ──────────────────────────────────────────────────
+    for (int i = 0; i < 2; i++) {
+        pktBuf[i] = (uint8_t*)ps_malloc(MAX_PACKET);
+        if (!pktBuf[i]) {
+            Serial.printf("FATAL: ps_malloc failed for pktBuf[%d]\n", i);
+            while (true) { delay(500); Serial.print('!'); }
+        }
+        memset(pktBuf[i], 0, MAX_PACKET);
     }
-    memset(pktBuf[0], 0, MAX_PACKET);
-    memset(pktBuf[1], 0, MAX_PACKET);
-    memset(nextBuf,   0, MAX_PACKET);
 
+    nextBuf = (uint8_t*)ps_malloc(MAX_PACKET);
+    if (!nextBuf) {
+        Serial.println("FATAL: ps_malloc failed for nextBuf");
+        while (true) { delay(500); Serial.print('!'); }
+    }
+    memset(nextBuf, 0, MAX_PACKET);
+
+    Serial.printf("PSRAM buffers OK (3 x %lu KB).  Free: %lu KB\n",
+                  (unsigned long)(MAX_PACKET / 1024),
+                  (unsigned long)(ESP.getFreePsram() / 1024));
+
+    // ── Mutexes ───────────────────────────────────────────────────────────
     swapMutex = xSemaphoreCreateMutex();
     nextMutex = xSemaphoreCreateMutex();
 
-    xTaskCreatePinnedToCore(displayTask, "display", 4096, nullptr, 1, nullptr, 0);
+    // ── Matrix ────────────────────────────────────────────────────────────
+    Serial.println("Initialising matrix...");
 
-    Serial.println("[BOOT] Frameon v1.5 ready");
+    HUB75_I2S_CFG mxconfig(PANEL_WIDTH, PANEL_HEIGHT, PANEL_CHAIN);
+    mxconfig.gpio.r1  = PIN_R1;  mxconfig.gpio.g1  = PIN_G1;
+    mxconfig.gpio.b1  = PIN_B1;  mxconfig.gpio.r2  = PIN_R2;
+    mxconfig.gpio.g2  = PIN_G2;  mxconfig.gpio.b2  = PIN_B2;
+    mxconfig.gpio.a   = PIN_A;   mxconfig.gpio.b   = PIN_B;
+    mxconfig.gpio.c   = PIN_C;   mxconfig.gpio.d   = PIN_D;
+    mxconfig.gpio.e   = PIN_E;   mxconfig.gpio.clk = PIN_CLK;
+    mxconfig.gpio.lat = PIN_LAT; mxconfig.gpio.oe  = PIN_OE;
+    mxconfig.driver      = HUB75_I2S_CFG::SHIFTREG;
+    mxconfig.clkphase    = false;
+    mxconfig.double_buff = true;
+
+    matrix = new MatrixPanel_I2S_DMA(mxconfig);
+    if (!matrix->begin()) {
+        Serial.println("FATAL: matrix->begin() failed.");
+        while (true) { delay(500); Serial.print('.'); }
+    }
+    matrix->setBrightness8(DEFAULT_BRIGHTNESS);
+    matrix->clearScreen();
+    matrix->flipDMABuffer();
+    Serial.println("Matrix OK.");
+
+    xTaskCreatePinnedToCore(displayTask, "display", 8192, nullptr, 2, nullptr, 0);
+
+    Serial.println("Ready.");
+    Serial.println("────────────────────────────────────────");
+    Serial.printf("  Protocol:    v1.5 (header %d B)\n", HEADER_SIZE);
+    Serial.printf("  Panel:       %dx%d\n", PANEL_WIDTH, REAL_HEIGHT);
+    Serial.printf("  Max frames:  %d  (%lu KB max payload)\n",
+                  MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
+    Serial.println("  Waiting for Frameon packets on USB Serial...");
+    Serial.println("────────────────────────────────────────");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// loop — Core 1
+// ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
     processSerial();
-}   
+    vTaskDelay(1);
+}

@@ -39,6 +39,33 @@
 //
 #pragma once
 
+// ─── GPIO pin assignments ────────────────────────────────────────────────────
+#define PIN_R1     4
+#define PIN_G1     5
+#define PIN_B1    12
+#define PIN_R2    13
+#define PIN_G2    14
+#define PIN_B2    15
+#define PIN_A     38
+#define PIN_B     39
+#define PIN_C     40
+#define PIN_D     41
+#define PIN_E     42
+#define PIN_CLK    2
+#define PIN_LAT    1
+#define PIN_OE    16
+
+// ─── Panel geometry ──────────────────────────────────────────────────────────
+// PANEL_WIDTH / REAL_HEIGHT already defined below — only add the extras here.
+#define PANEL_CHAIN         1
+#define DEFAULT_BRIGHTNESS  128
+#define PANEL_WIDTH    64
+#define PANEL_HEIGHT   64
+#define REAL_HEIGHT    32
+
+
+
+
 #define FRM_MAGIC_0    0x46   // 'F'
 #define FRM_MAGIC_1    0x52   // 'R'
 #define FRM_MAGIC_2    0x4D   // 'M'
