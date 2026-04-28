@@ -57,7 +57,7 @@ if (elapsedMs < bootDuration) {
     int barY = 22;  // Lower portion of the panel
 
     // Draw background (border)
-    matrix->drawRect(barX, barY, barWidth, barHeight, dim);
+    matrix->drawRect(barX, barY, barWidth, barHeight, dim);     
 
     // Fill progress (accounting for 1px border on each side)
     int fillWidth = progress * (barWidth - 2);
