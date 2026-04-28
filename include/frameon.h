@@ -58,12 +58,10 @@
 // ─── Panel geometry ──────────────────────────────────────────────────────────
 // PANEL_WIDTH / REAL_HEIGHT already defined below — only add the extras here.
 #define PANEL_CHAIN         1
-#define DEFAULT_BRIGHTNESS  128
+#define DEFAULT_BRIGHTNESS  128     
 #define PANEL_WIDTH    64
 #define PANEL_HEIGHT   64
-#define REAL_HEIGHT    32
-
-
+#define REAL_HEIGHT    32       
 
 
 #define FRM_MAGIC_0    0x46   // 'F'
