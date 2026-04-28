@@ -189,7 +189,7 @@ static const Glyph kFontPhantasm[16] = {
 };
 
 // Font table — indexed by fontId (0=Polymorph … 6=Phantasm)
-static const Glyph* kFonts[7] = {
+const Glyph* kFonts[7] = {
     kFontPolymorph,
     kFontBrickwork,
     kFontWaterfox,
@@ -200,17 +200,17 @@ static const Glyph* kFonts[7] = {
 };
 
 // Active font pointer — set at the start of overdrawClock
-static const Glyph* gActiveFont = kFontPolymorph;
+const Glyph* gActiveFont = kFontPolymorph;
 
-static int glyphWidth(char c) { return gActiveFont[glyphIndex(c)].w + 1; } // +1 gap
+int glyphWidth(char c) { return gActiveFont[glyphIndex(c)].w + 1; } // +1 gap
 
-static int textWidth(const char* s) {
+int textWidth(const char* s) {
     int w = 0;
     while (*s) { w += glyphWidth(*s++); }
     return w > 0 ? w - 1 : 0; // no trailing gap
 }
 
-static void drawGlyph(char c, int x, int y, uint16_t color) {
+void drawGlyph(char c, int x, int y, uint16_t color) {
     const Glyph& g = gActiveFont[glyphIndex(c)];
     for (int row = 0; row < 7; row++) {
         const uint8_t bits = g.rows[row];
@@ -222,7 +222,7 @@ static void drawGlyph(char c, int x, int y, uint16_t color) {
     }
 }
 
-static void drawText(const char* s, int x, int y, uint16_t color) {
+void drawText(const char* s, int x, int y, uint16_t color) {
     while (*s) {
         drawGlyph(*s, x, y, color);
         x += glyphWidth(*s);

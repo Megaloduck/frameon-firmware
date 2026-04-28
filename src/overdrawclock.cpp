@@ -4,6 +4,10 @@
 //                          4=Destroked 5=Stereotype 6=Phantasm
 // ─────────────────────────────────────────────────────────────────────────────
 
+include "frameon.h"
+include "clockfonts.h"
+include "waitingscreen.h"
+
 static void overdrawClock(uint32_t epochSec, uint32_t elapsedMs,
                            int16_t tzOffsetMin, uint8_t flags,
                            uint8_t fontId, int8_t offX, int8_t offY,

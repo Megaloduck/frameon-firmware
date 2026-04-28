@@ -108,7 +108,7 @@ static bool isLeap(int y) {
     return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
 }
 
-static ClockTime epochToTime(uint32_t epochSec, int16_t tzOffsetMin) {
+ClockTime epochToTime(uint32_t epochSec, int16_t tzOffsetMin) {
     int32_t t = (int32_t)epochSec + (int32_t)tzOffsetMin * 60;
     if (t < 0) t = 0;
 
@@ -139,118 +139,4 @@ static ClockTime epochToTime(uint32_t epochSec, int16_t tzOffsetMin) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // overdrawClock
-// ─────────────────────────────────────────────────────────────────────────────
-
-void overdrawClock(
-    uint32_t epochSec,
-    uint32_t wallMs,
-    int16_t  tzOffsetMin,
-    uint8_t  flags,
-    uint8_t  /*fontId*/,
-    int8_t   offX,
-    int8_t   offY,
-    uint16_t hoursCol,
-    uint16_t minutesCol,
-    uint16_t secondsCol,
-    uint16_t colonCol,
-    uint16_t dateCol,
-    uint16_t ampmCol)
-{
-    if (!(flags & CLK_FLAG_PRESENT)) return;
-
-    const bool h12      = (flags & CLK_FLAG_H12)      != 0;
-    const bool showSec  = (flags & CLK_FLAG_SECONDS)   != 0;
-    const bool showDate = (flags & CLK_FLAG_DATE)      != 0;
-    const bool blinkCol = (flags & CLK_FLAG_BLINK)     != 0;
-    const bool showAmPm = (flags & CLK_FLAG_AMPM)      != 0;
-
-    // Derive current wall time
-    const uint32_t wallSec = epochSec + wallMs / 1000;
-    const ClockTime ct = epochToTime(wallSec, tzOffsetMin);
-
-    // Blink colon: invisible for the second half of each second
-    const bool colonVisible = !blinkCol || (wallMs % 1000) < 500;
-
-    // Build string buffers
-    char hBuf[4], mBuf[4], sBuf[4], ampmBuf[4], dateBuf[12];
-
-    if (h12) {
-        int dh = ct.hour % 12;
-        if (dh == 0) dh = 12;
-        snprintf(hBuf,    sizeof(hBuf),    "%d",  dh);
-        snprintf(ampmBuf, sizeof(ampmBuf), "%s",  ct.hour < 12 ? "AM" : "PM");
-    } else {
-        snprintf(hBuf,    sizeof(hBuf),    "%02d", ct.hour);
-        ampmBuf[0] = '\0';
-    }
-    snprintf(mBuf,    sizeof(mBuf),    "%02d", ct.minute);
-    snprintf(sBuf,    sizeof(sBuf),    "%02d", ct.second);
-    snprintf(dateBuf, sizeof(dateBuf), "%02d.%02d.%02d",
-             ct.day, ct.month, ct.year % 100);
-
-    // ── Measure total time-row width ──────────────────────────────────────
-    // Layout mirrors clock_widget.dart spacing exactly:
-    //   spacingBeforeColon = 2, colonVisualOffset = -1, spacingAfterColon = 0
-    //   spacingGeneral (before AM/PM) = 1
-
-    int timeW = strPixelWidth(hBuf)
-              + 2                        // spacingBeforeColon
-              + glyphWidth(':')          // colon glyph + gap (gap = 1)
-              + strPixelWidth(mBuf);
-
-    if (showSec) {
-        timeW += 2                       // spacingBeforeColon
-               + glyphWidth(':')
-               + strPixelWidth(sBuf);
-    }
-    if (showAmPm && ampmBuf[0]) {
-        timeW += 1 + strPixelWidth(ampmBuf); // spacingGeneral + ampm
-    }
-
-    // ── Vertical layout ───────────────────────────────────────────────────
-    const int charH  = 7;
-    const int totalH = charH + (showDate ? charH + 2 : 0);
-    const int startY = (REAL_HEIGHT - totalH) / 2 + (int)offY;
-    const int timeY  = startY;
-    const int dateY  = startY + charH + 2;
-
-    // ── Draw time row (centered + offset) ─────────────────────────────────
-    int cx = (PANEL_WIDTH - timeW) / 2 + (int)offX;
-
-    // Hours
-    drawStr(hBuf, cx, timeY, hoursCol);
-    cx += strPixelWidth(hBuf);
-
-    // Colon H:M  (spacingBeforeColon=2, colonVisualOffset=-1)
-    cx += 2;
-    if (colonVisible) drawGlyph(':', cx - 1, timeY, colonCol);
-    cx += glyphWidth(':') - 1;   // advance without the -1 visual offset
-
-    // Minutes
-    drawStr(mBuf, cx, timeY, minutesCol);
-    cx += strPixelWidth(mBuf);
-
-    // Colon M:S + seconds
-    if (showSec) {
-        cx += 2;
-        if (colonVisible) drawGlyph(':', cx - 1, timeY, colonCol);
-        cx += glyphWidth(':') - 1;
-        drawStr(sBuf, cx, timeY, secondsCol);
-        cx += strPixelWidth(sBuf);
-    }
-
-    // AM/PM
-    if (showAmPm && ampmBuf[0]) {
-        cx += 1;
-        drawStr(ampmBuf, cx, timeY, ampmCol);
-    }
-
-    // ── Draw date row (centered below time) ───────────────────────────────
-    if (showDate) {
-        const int dw = strPixelWidth(dateBuf);
-        const int dx = (PANEL_WIDTH - dw) / 2 + (int)offX;
-        drawStr(dateBuf, dx, dateY, dateCol);
-    }
-
-    // NOTE: flipDMABuffer() is called by displayTask after this returns.
-}   
+   
