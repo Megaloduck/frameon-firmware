@@ -1,31 +1,20 @@
 /*
- * Frameon Firmware v1.6
+ * Frameon Firmware v1.7
  * ESP32-S3  ·  P4-2121-64×32 HUB75E
  *
+ * v1.7 — Clean architecture
+ *   overdrawClock() and all font tables moved to clockhelper.cpp.
+ *   main.cpp now delegates via #include "clockhelper.h" — fonts live
+ *   in exactly one place, matching clockhelper.cpp ↔ polymorph_font.dart.
+ *
  * v1.6 — Full multi-font clock support
- *   All 7 Frameon fonts (Polymorph, Brickwork, Waterfox, Vandalism,
- *   Destroked, Stereotype, Phantasm) are now embedded in the firmware.
- *   overdrawClock() selects the active font via the fontId byte in the
- *   packet header, exactly matching the Dart-side font selection.
- *
- * v1.5 — Clock overdraw
- *   The app no longer bakes clock digits into frame pixels. Instead the header
- *   carries a Unix timestamp (clockEpochSec) recorded at commit time plus
- *   clock display flags. displayTask derives the current wall-clock time from:
- *
- *       wallSec = clockEpochSec + (millis() - commitTimeMs) / 1000
- *
- *   and overdraw the clock on top of the rendered frame, exactly like
- *   overdrawProgressBar does for Spotify. This means:
- *     • Seconds always tick correctly, with no loop-reset issues.
- *     • Minutes and hours update naturally forever after one sync.
- *     • Blink-colon uses millis() % 1000 < 500 — always accurate.
- *     • No latency compensation needed — commitTimeMs is set at ACK time.
+ * v1.5 — Clock overdraw (live millis-based rendering)
  */
 
 #include <Arduino.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include "frameon.h"
+#include "clockhelper.h"
 #include "waitingscreen.h"
 
 MatrixPanel_I2S_DMA* matrix = nullptr;
@@ -69,16 +58,16 @@ static volatile uint16_t activeDateColor     = 0x07E0;
 static volatile uint16_t activeAmpmColor     = 0x07E0;
 
 // Next-song preload
-static uint8_t*          nextBuf      = nullptr;
-static volatile bool     nextBufReady = false;
+static uint8_t*          nextBuf        = nullptr;
+static volatile bool     nextBufReady   = false;
 static volatile int      nextFrameCount = 0;
 static volatile uint16_t nextFrameDurMs = 100;
 static volatile uint32_t nextStartPosMs = 0;
 static volatile uint32_t nextTrackDurMs = 0;
-static volatile uint8_t  nextBarX = 0;
-static volatile uint8_t  nextBarY = 0;
-static volatile uint8_t  nextBarW = 0;
-static volatile uint16_t nextBarColor = 0x11C5;
+static volatile uint8_t  nextBarX       = 0;
+static volatile uint8_t  nextBarY       = 0;
+static volatile uint8_t  nextBarW       = 0;
+static volatile uint16_t nextBarColor   = 0x11C5;
 
 static SemaphoreHandle_t swapMutex = nullptr;
 static SemaphoreHandle_t nextMutex = nullptr;
@@ -105,7 +94,6 @@ static uint8_t  pktBarX         = 0;
 static uint8_t  pktBarY         = 0;
 static uint8_t  pktBarW         = 0;
 static uint16_t pktBarColor     = 0x11C5;
-// v1.5 clock fields
 static uint8_t  pktClockFlags    = 0;
 static uint32_t pktClockEpochSec = 0;
 static int16_t  pktClockTzMin    = 0;
@@ -128,12 +116,6 @@ static void     renderFrame(int bufIdx, int frameIdx);
 static void     overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
                                     uint8_t barX, uint8_t barY, uint8_t barW,
                                     uint16_t barColor);
-static void     overdrawClock(uint32_t epochSec, uint32_t elapsedMs,
-                               int16_t tzOffsetMin, uint8_t flags,
-                               uint8_t fontId, int8_t offX, int8_t offY,
-                               uint16_t hoursCol, uint16_t minutesCol,
-                               uint16_t secondsCol, uint16_t colonCol,
-                               uint16_t dateCol,   uint16_t ampmCol);
 static void     parseHeader();
 static void     processPacket();
 static void     processSerial();
@@ -188,350 +170,6 @@ static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
         for (int x = 0; x < barW; x++) {
             matrix->drawPixel(barX + x, row, x < filled ? barColor : bgColor);
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Multi-font clock renderer (v1.6)
-//
-// Each font table has 16 entries, indexed as:
-//   0-9  → '0'-'9'
-//   10   → ':'
-//   11   → '.'
-//   12   → 'A'
-//   13   → 'M'
-//   14   → 'P'
-//   15   → ' ' (space / fallback)
-//
-// Glyph format: w = pixel width, rows[7] = 7-row bitmask, MSB = leftmost pixel.
-// Sourced directly from lib/engine/renderer/fonts/*.dart
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct Glyph { uint8_t w; uint8_t rows[7]; };
-
-static int glyphIndex(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c == ':') return 10;
-    if (c == '.') return 11;
-    if (c == 'A') return 12;
-    if (c == 'M') return 13;
-    if (c == 'P') return 14;
-    return 15;
-}
-
-// ── 0: Polymorph ─────────────────────────────────────────────────────────────
-static const Glyph kFontPolymorph[16] = {
-    {4, {0x06,0x09,0x09,0x09,0x09,0x09,0x06}}, // 0
-    {2, {0x03,0x01,0x01,0x01,0x01,0x01,0x01}}, // 1
-    {4, {0x06,0x09,0x01,0x02,0x04,0x08,0x0F}}, // 2
-    {4, {0x06,0x09,0x01,0x06,0x01,0x09,0x06}}, // 3
-    {4, {0x01,0x03,0x05,0x09,0x0F,0x01,0x01}}, // 4
-    {4, {0x0F,0x08,0x0E,0x01,0x01,0x09,0x06}}, // 5
-    {4, {0x06,0x09,0x08,0x0E,0x09,0x09,0x06}}, // 6
-    {4, {0x0F,0x01,0x02,0x02,0x04,0x04,0x04}}, // 7
-    {4, {0x06,0x09,0x09,0x06,0x09,0x09,0x06}}, // 8
-    {4, {0x06,0x09,0x09,0x07,0x01,0x09,0x06}}, // 9
-    {1, {0x00,0x01,0x00,0x00,0x00,0x01,0x00}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {5, {0x04,0x0A,0x11,0x11,0x1F,0x11,0x11}}, // A
-    {5, {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}}, // M
-    {5, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}}, // P
-    {3, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 1: Brickwork ─────────────────────────────────────────────────────────────
-static const Glyph kFontBrickwork[16] = {
-    {5, {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}}, // 0
-    {5, {0x04,0x0C,0x04,0x04,0x04,0x04,0x1F}}, // 1
-    {5, {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}}, // 2
-    {5, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}}, // 3
-    {5, {0x03,0x05,0x09,0x11,0x1F,0x01,0x01}}, // 4
-    {5, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}}, // 5
-    {5, {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x11,0x01,0x02,0x04,0x04,0x04}}, // 7
-    {5, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, // 8
-    {5, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}}, // 9
-    {1, {0x00,0x01,0x01,0x00,0x00,0x01,0x01}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x01,0x01}}, // .
-    {5, {0x0E,0x11,0x1F,0x11,0x11,0x11,0x11}}, // A
-    {5, {0x11,0x1B,0x15,0x11,0x11,0x11,0x11}}, // M
-    {5, {0x1E,0x11,0x1E,0x10,0x10,0x10,0x10}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 2: Waterfox ──────────────────────────────────────────────────────────────
-// Note: '0' and '8' are 6px wide; 'A' is 7px; 'M' is 9px (clamped to 8).
-static const Glyph kFontWaterfox[16] = {
-    {6, {0x0C,0x12,0x21,0x21,0x21,0x12,0x0C}}, // 0  (w=6)
-    {3, {0x02,0x06,0x02,0x02,0x02,0x02,0x07}}, // 1
-    {5, {0x0E,0x11,0x01,0x02,0x04,0x09,0x1F}}, // 2
-    {5, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}}, // 3
-    {5, {0x02,0x06,0x0A,0x12,0x1F,0x02,0x07}}, // 4
-    {5, {0x1F,0x10,0x16,0x19,0x01,0x11,0x0E}}, // 5
-    {5, {0x0E,0x10,0x16,0x19,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x11,0x02,0x02,0x04,0x04,0x04}}, // 7
-    {6, {0x0C,0x12,0x12,0x1E,0x21,0x21,0x1E}}, // 8  (w=6)
-    {5, {0x0E,0x11,0x11,0x13,0x0D,0x01,0x0E}}, // 9
-    {1, {0x00,0x00,0x01,0x00,0x00,0x00,0x01}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {7, {0x08,0x14,0x14,0x14,0x3E,0x22,0x77}}, // A  (w=7)
-    {8, {0x83,0xC6,0xC6,0xAA,0xAA,0x92,0xD7}}, // M  (w=9 → low 8 bits)
-    {6, {0x3E,0x11,0x11,0x1E,0x10,0x10,0x38}}, // P  (w=6)
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 3: Vandalism ─────────────────────────────────────────────────────────────
-static const Glyph kFontVandalism[16] = {
-    {5, {0x0E,0x19,0x1B,0x1D,0x1D,0x19,0x0E}}, // 0
-    {3, {0x02,0x06,0x06,0x02,0x02,0x02,0x07}}, // 1
-    {5, {0x0E,0x19,0x19,0x02,0x04,0x0C,0x1F}}, // 2
-    {5, {0x0E,0x19,0x01,0x06,0x01,0x19,0x0E}}, // 3
-    {5, {0x06,0x0E,0x0A,0x1A,0x1F,0x02,0x07}}, // 4
-    {5, {0x0F,0x18,0x18,0x1E,0x01,0x19,0x0E}}, // 5
-    {5, {0x0E,0x19,0x18,0x1E,0x19,0x19,0x0E}}, // 6
-    {5, {0x0E,0x19,0x19,0x02,0x04,0x04,0x04}}, // 7
-    {5, {0x0E,0x19,0x19,0x0E,0x19,0x19,0x0E}}, // 8
-    {5, {0x0E,0x19,0x19,0x0F,0x01,0x11,0x0E}}, // 9
-    {1, {0x00,0x00,0x01,0x00,0x00,0x01,0x00}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {5, {0x06,0x0E,0x0E,0x1F,0x19,0x19,0x19}}, // A
-    {5, {0x19,0x1B,0x1F,0x1D,0x1D,0x19,0x19}}, // M
-    {5, {0x1E,0x0D,0x0D,0x0E,0x0C,0x0C,0x1E}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 4: Destroked ─────────────────────────────────────────────────────────────
-static const Glyph kFontDestroked[16] = {
-    {5, {0x0E,0x1B,0x11,0x15,0x11,0x1B,0x0E}}, // 0
-    {3, {0x02,0x04,0x02,0x02,0x02,0x02,0x02}}, // 1
-    {5, {0x16,0x09,0x01,0x0E,0x10,0x12,0x1D}}, // 2
-    {5, {0x0F,0x12,0x02,0x04,0x02,0x11,0x0E}}, // 3
-    {5, {0x19,0x12,0x11,0x1D,0x03,0x01,0x01}}, // 4
-    {5, {0x1F,0x08,0x10,0x1F,0x01,0x0A,0x14}}, // 5
-    {5, {0x0E,0x1B,0x10,0x1E,0x11,0x1B,0x0E}}, // 6
-    {5, {0x0F,0x12,0x04,0x08,0x04,0x04,0x04}}, // 7
-    {5, {0x0F,0x12,0x11,0x0E,0x11,0x09,0x16}}, // 8
-    {5, {0x0D,0x12,0x11,0x0F,0x01,0x09,0x16}}, // 9
-    {1, {0x00,0x02,0x00,0x00,0x00,0x02,0x00}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {5, {0x16,0x09,0x09,0x0F,0x09,0x09,0x09}}, // A
-    {7, {0x61,0x5A,0x52,0x4A,0x4A,0x4A,0x49}}, // M  (w=7)
-    {5, {0x1E,0x09,0x09,0x0E,0x08,0x08,0x08}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 5: Stereotype ────────────────────────────────────────────────────────────
-static const Glyph kFontStereotype[16] = {
-    {4, {0x06,0x09,0x0B,0x0D,0x09,0x09,0x06}}, // 0
-    {3, {0x01,0x03,0x05,0x01,0x01,0x01,0x01}}, // 1
-    {4, {0x06,0x09,0x01,0x02,0x04,0x08,0x0F}}, // 2
-    {4, {0x06,0x09,0x01,0x07,0x01,0x09,0x06}}, // 3
-    {4, {0x01,0x03,0x05,0x09,0x0F,0x01,0x01}}, // 4
-    {4, {0x0F,0x08,0x08,0x0E,0x01,0x09,0x06}}, // 5
-    {4, {0x06,0x09,0x08,0x0E,0x09,0x09,0x06}}, // 6
-    {4, {0x0F,0x01,0x02,0x04,0x08,0x08,0x08}}, // 7
-    {4, {0x06,0x09,0x09,0x06,0x09,0x09,0x06}}, // 8
-    {4, {0x06,0x09,0x09,0x07,0x01,0x09,0x06}}, // 9
-    {2, {0x00,0x03,0x00,0x00,0x00,0x00,0x03}}, // :
-    {2, {0x00,0x00,0x00,0x00,0x02,0x02,0x04}}, // .
-    {4, {0x06,0x09,0x09,0x09,0x0F,0x09,0x09}}, // A
-    {7, {0x41,0x63,0x55,0x49,0x41,0x41,0x41}}, // M  (w=7)
-    {4, {0x0E,0x09,0x09,0x0E,0x08,0x08,0x08}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 6: Phantasm ──────────────────────────────────────────────────────────────
-static const Glyph kFontPhantasm[16] = {
-    {5, {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}}, // 0
-    {3, {0x02,0x06,0x02,0x02,0x02,0x02,0x07}}, // 1
-    {5, {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}}, // 2
-    {5, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}}, // 3
-    {5, {0x02,0x12,0x12,0x12,0x1F,0x02,0x02}}, // 4
-    {5, {0x1F,0x10,0x10,0x1F,0x01,0x11,0x0E}}, // 5
-    {5, {0x0E,0x11,0x10,0x1E,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x01,0x01,0x02,0x04,0x04,0x04}}, // 7
-    {5, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, // 8
-    {5, {0x0E,0x11,0x11,0x0F,0x01,0x11,0x0E}}, // 9
-    {1, {0x00,0x00,0x01,0x00,0x00,0x01,0x00}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {5, {0x04,0x0A,0x11,0x11,0x1F,0x11,0x11}}, // A
-    {7, {0x41,0x63,0x55,0x49,0x41,0x41,0x41}}, // M  (w=7)
-    {5, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}}, // P
-    {3, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// Font table — indexed by fontId (0=Polymorph … 6=Phantasm)
-static const Glyph* const kFonts[7] = {
-    kFontPolymorph,
-    kFontBrickwork,
-    kFontWaterfox,
-    kFontVandalism,
-    kFontDestroked,
-    kFontStereotype,
-    kFontPhantasm,
-};
-
-// Active font pointer — set at the start of overdrawClock()
-static const Glyph* gActiveFont = kFontPolymorph;
-
-static int glyphWidth(char c) { return gActiveFont[glyphIndex(c)].w + 1; } // +1 gap
-
-static int textWidth(const char* s) {
-    int w = 0;
-    while (*s) { w += glyphWidth(*s++); }
-    return w > 0 ? w - 1 : 0; // no trailing gap
-}
-
-static void drawGlyph(char c, int x, int y, uint16_t color) {
-    const Glyph& g = gActiveFont[glyphIndex(c)];
-    for (int row = 0; row < 7; row++) {
-        const uint8_t bits = g.rows[row];
-        for (int col = 0; col < g.w; col++) {
-            if ((bits >> (g.w - 1 - col)) & 1) {
-                matrix->drawPixel(x + col, y + row, color);
-            }
-        }
-    }
-}
-
-static void drawText(const char* s, int x, int y, uint16_t color) {
-    while (*s) {
-        drawGlyph(*s, x, y, color);
-        x += glyphWidth(*s);
-        s++;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Simple time struct
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct ClockTime { int hour, minute, second, day, month, year; };
-
-static const uint8_t kDaysInMonth[2][12] = {
-    {31,28,31,30,31,30,31,31,30,31,30,31},
-    {31,29,31,30,31,30,31,31,30,31,30,31},
-};
-
-static bool isLeap(int y) {
-    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-}
-
-static ClockTime epochToTime(uint32_t epochSec, int16_t tzOffsetMin) {
-    int32_t t = (int32_t)epochSec + (int32_t)tzOffsetMin * 60;
-    if (t < 0) t = 0;
-
-    ClockTime ct;
-    ct.second = t % 60; t /= 60;
-    ct.minute = t % 60; t /= 60;
-    ct.hour   = t % 24; t /= 24;
-
-    uint32_t days = (uint32_t)t;
-    int y = 1970;
-    while (true) {
-        uint32_t diy = isLeap(y) ? 366 : 365;
-        if (days < diy) break;
-        days -= diy;
-        y++;
-    }
-    ct.year = y;
-    int leap = isLeap(y) ? 1 : 0;
-    int m = 1;
-    while (m <= 12 && days >= kDaysInMonth[leap][m-1]) {
-        days -= kDaysInMonth[leap][m-1];
-        m++;
-    }
-    ct.month = m;
-    ct.day   = (int)days + 1;
-    return ct;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// overdrawClock — renders clock on top of the current frame
-// fontId: 0=Polymorph 1=Brickwork 2=Waterfox 3=Vandalism
-//          4=Destroked 5=Stereotype 6=Phantasm
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void overdrawClock(uint32_t epochSec, uint32_t elapsedMs,
-                           int16_t tzOffsetMin, uint8_t flags,
-                           uint8_t fontId, int8_t offX, int8_t offY,
-                           uint16_t hoursCol,   uint16_t minutesCol,
-                           uint16_t secondsCol, uint16_t colonCol,
-                           uint16_t dateCol,    uint16_t ampmCol) {
-
-    if (!(flags & CLK_FLAG_PRESENT)) return;
-
-    // Select font — clamp to valid range
-    gActiveFont = kFonts[fontId < 7 ? fontId : 0];
-
-    const bool h12      = flags & CLK_FLAG_H12;
-    const bool showSec  = flags & CLK_FLAG_SECONDS;
-    const bool showDate = flags & CLK_FLAG_DATE;
-    const bool blinkCol = flags & CLK_FLAG_BLINK;
-    const bool showAmPm = flags & CLK_FLAG_AMPM;
-
-    const uint32_t wallSec    = epochSec + elapsedMs / 1000;
-    ClockTime      ct         = epochToTime(wallSec, tzOffsetMin);
-    const bool     colonVisible = !blinkCol || (elapsedMs % 1000) < 500;
-
-    char hBuf[4], mBuf[4], sBuf[4], ampmBuf[4], dateBuf[10];
-
-    int dispHour = ct.hour;
-    if (h12) {
-        dispHour = ct.hour % 12;
-        if (dispHour == 0) dispHour = 12;
-        snprintf(hBuf,    sizeof(hBuf),    "%d",  dispHour);
-        snprintf(ampmBuf, sizeof(ampmBuf), "%s",  ct.hour < 12 ? "AM" : "PM");
-    } else {
-        snprintf(hBuf,    sizeof(hBuf),    "%02d", dispHour);
-        ampmBuf[0] = '\0';
-    }
-    snprintf(mBuf,    sizeof(mBuf),    "%02d", ct.minute);
-    snprintf(sBuf,    sizeof(sBuf),    "%02d", ct.second);
-    snprintf(dateBuf, sizeof(dateBuf), "%02d.%02d.%02d",
-             ct.day, ct.month, ct.year % 100);
-
-    int timeW = textWidth(hBuf)
-              + 2 + glyphWidth(':')
-              + textWidth(mBuf);
-    if (showSec)   timeW += 2 + glyphWidth(':') + textWidth(sBuf);
-    if (showAmPm)  timeW += 1 + textWidth(ampmBuf);
-
-    const int charH  = 7;
-    const int totalH = charH + (showDate ? charH + 2 : 0);
-    const int startY = (REAL_HEIGHT - totalH) / 2 + (int)offY;
-    const int timeY  = startY;
-    const int dateY  = startY + charH + 2;
-
-    int cx = (PANEL_WIDTH - timeW) / 2 + (int)offX;
-
-    drawText(hBuf, cx, timeY, hoursCol);
-    cx += textWidth(hBuf);
-
-    cx += 2;
-    if (colonVisible) drawGlyph(':', cx - 1, timeY, colonCol);
-    cx += glyphWidth(':') - 1;
-
-    drawText(mBuf, cx, timeY, minutesCol);
-    cx += textWidth(mBuf);
-
-    if (showSec) {
-        cx += 2;
-        if (colonVisible) drawGlyph(':', cx - 1, timeY, colonCol);
-        cx += glyphWidth(':') - 1;
-        drawText(sBuf, cx, timeY, secondsCol);
-        cx += textWidth(sBuf);
-    }
-
-    if (showAmPm) {
-        cx += 1;
-        drawText(ampmBuf, cx, timeY, ampmCol);
-    }
-
-    if (showDate) {
-        int dw = textWidth(dateBuf);
-        int dx = (PANEL_WIDTH - dw) / 2 + (int)offX;
-        drawText(dateBuf, dx, dateY, dateCol);
     }
 }
 
@@ -782,8 +420,8 @@ static void displayTask(void* /*param*/) {
 
         if (currentFrame >= count) currentFrame = 0;
 
-        const uint32_t now      = millis();
-        const uint32_t wallMs   = now - committed;
+        const uint32_t now       = millis();
+        const uint32_t wallMs    = now - committed;
         const uint32_t songPosMs = startPos + wallMs;
 
         // Next-song preload check (Spotify)
@@ -822,10 +460,10 @@ static void displayTask(void* /*param*/) {
         // 1. Render background frame
         renderFrame(buf, currentFrame);
 
-        // 2. Overdraw progress bar (Spotify)
+        // 2. Overdraw Spotify progress bar
         overdrawProgressBar(songPosMs, trackDur, barX, barY, barW, barColor);
 
-        // 3. Overdraw clock with correct font
+        // 3. Overdraw clock (implemented in clockhelper.cpp)
         if (clockFlags & CLK_FLAG_PRESENT) {
             overdrawClock(epochSec, wallMs, tzMin, clockFlags,
                           clockFont, clockOffX, clockOffY,
@@ -833,7 +471,7 @@ static void displayTask(void* /*param*/) {
                           colonCol, dateCol, ampmCol);
         }
 
-        // 4. Commit all three layers atomically
+        // 4. Commit all layers atomically
         matrix->flipDMABuffer();
 
         const uint32_t elapsed  = millis() - t0;
@@ -850,7 +488,7 @@ static void displayTask(void* /*param*/) {
 void setup() {
     Serial.begin(921600);
     delay(200);
-    Serial.println("\n\nFrameon Firmware v1.6");
+    Serial.println("\n\nFrameon Firmware v1.7");
     Serial.println("════════════════════════════════════════");
 
     for (int i = 0; i < 2; i++) {
@@ -908,7 +546,7 @@ void setup() {
     Serial.printf("  Panel:       %dx%d\n", PANEL_WIDTH, REAL_HEIGHT);
     Serial.printf("  Max frames:  %d  (%lu KB max payload)\n",
                   MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
-    Serial.printf("  Clock fonts: 7 (Polymorph…Phantasm)\n");
+    Serial.printf("  Clock fonts: 7 (Polymorph…Phantasm) via clockhelper.cpp\n");
     Serial.println("  Waiting for Frameon packets on USB Serial...");
     Serial.println("────────────────────────────────────────");
 }
