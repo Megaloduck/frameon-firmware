@@ -3,32 +3,18 @@
 #include <stdint.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// pomodorohelper.h — Firmware-side live Pomodoro timer renderer (v1.8)
+// pomodorohelper.h — Firmware-side live Pomodoro timer renderer (v1.9)
 //
-// Mirrors the same pattern as clockhelper.h / overdrawClock().
+// v1.9 — Layout overdraw support.
+//        overdrawPomodoro() now accepts a `layout` byte so the panel renders
+//        the same layout the user picked in the app dropdown.
 //
-// The app sends the current timer state in the packet header at sync time:
-//   • remainingSec  — seconds left in the current phase when the packet was
-//                     committed (captured at ACK, same moment as commitTimeMs)
-//   • phase         — 0=focus  1=shortBreak  2=longBreak
-//   • isRunning     — whether the timer was running at commit
+//        Two layouts are supported:
+//          POMO_LAYOUT_SPLIT      — arc ring left, MM:SS + phase label right.
+//          POMO_LAYOUT_MINIMALIST — large MM left, vertical bar + dots right.
 //
-// overdrawPomodoro() derives the live remaining time from:
-//
-//     liveSec = remainingSec - (millis() - commitTimeMs) / 1000
-//               (clamped to 0, only decremented while isRunning)
-//
-// and paints the countdown on top of the current frame, exactly like
-// overdrawClock() does for the wall clock. This means:
-//   • Seconds tick correctly on the panel with no baked pixels.
-//   • Blink-colon uses millis() % 1000 < 500 — always accurate.
-//   • The timer freezes naturally when isRunning == false.
-//   • No phase transitions happen on the device — the app is the source of
-//     truth for phase logic. When the user advances the phase in the app,
-//     they sync again and the device gets a fresh header.
-//
-// Must be called only from Core 0 (displayTask), after renderFrame() and
-// before flipDMABuffer(), in the same order as overdrawClock().
+// The app sends the layout value in the reserved byte [63] of the v1.8
+// pomodoro descriptor (previously always 0x00). No header size change needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Phase constants (must match PomodoroState enum order in Dart) ─────────────
@@ -36,7 +22,12 @@
 #define POMO_PHASE_SHORT_BREAK  1
 #define POMO_PHASE_LONG_BREAK   2
 
-// ── Flag bits (pomodoroFlags byte in header) ──────────────────────────────────
+// ── Layout constants (must match PomodoroLayout enum order in Dart) ───────────
+// Dart enum order: splitLayout=0, minimalist=1
+#define POMO_LAYOUT_SPLIT       0
+#define POMO_LAYOUT_MINIMALIST  1
+
+// ── Flag bits (pomodoroFlags byte in header [52]) ─────────────────────────────
 #define POMO_FLAG_PRESENT    0x01  // pomodoro layer is active
 #define POMO_FLAG_RUNNING    0x02  // timer was running at commit time
 #define POMO_FLAG_SECONDS    0x04  // show seconds on the display
@@ -46,19 +37,25 @@
 /// Render the live Pomodoro countdown on top of the current frame.
 ///
 /// @param remainingSec   Seconds remaining in the current phase at commit.
+/// @param totalSec       Total seconds for the current phase (for progress).
 /// @param wallMs         millis() - commitTimeMs  (elapsed since commit).
 /// @param phase          POMO_PHASE_* constant for the active phase.
+/// @param layout         POMO_LAYOUT_* constant (splitLayout or minimalist).
 /// @param flags          POMO_FLAG_* bitmask (present, running, seconds, etc.)
-/// @param session        Current session number (1-based, for dot display).
+/// @param session        Current session number (1-based).
+/// @param sessionsTotal  Total sessions before long break (for dot count).
 /// @param offX           Signed horizontal pixel nudge.
 /// @param offY           Signed vertical pixel nudge.
-/// @param activeColor    RGB565 colour for the timer digits (phase colour).
+/// @param activeColor    RGB565 colour for the active phase.
 void overdrawPomodoro(
     uint32_t remainingSec,
+    uint32_t totalSec,
     uint32_t wallMs,
     uint8_t  phase,
+    uint8_t  layout,
     uint8_t  flags,
     uint8_t  session,
+    uint8_t  sessionsTotal,
     int8_t   offX,
     int8_t   offY,
     uint16_t activeColor

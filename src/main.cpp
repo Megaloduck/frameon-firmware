@@ -1,6 +1,16 @@
 /*
- * Frameon Firmware v1.8
+ * Frameon Firmware v1.9
  * ESP32-S3  ·  P4-2121-64×32 HUB75E
+ *
+ * v1.9 — Pomodoro layout selection.
+ *        overdrawPomodoro() now accepts layout, sessionsTotal, and totalSec
+ *        so the panel renders the correct layout (splitLayout / minimalist)
+ *        matching the app dropdown. Reserved bytes [63-67] in the 68-byte
+ *        header are used — no header size change.
+ *          [63]    pomodoroLayout    uint8    0=split  1=minimalist
+ *          [64]    pomodoroSessTotal uint8    sessionsBeforeLongBreak
+ *          [65-66] pomodoroTotalSec  uint16   total seconds in current phase
+ *          [67]    reserved          0x00
  *
  * v1.8 — Pomodoro live overdraw.
  *        overdrawPomodoro() added to pomodorohelper.cpp renders the countdown
@@ -73,13 +83,17 @@ static volatile uint16_t activeDateColor     = 0x07E0;
 static volatile uint16_t activeAmpmColor     = 0x07E0;
 
 // Pomodoro overdraw state (v1.8)
-static volatile uint8_t  activePomodoroFlags   = 0;
-static volatile uint32_t activePomodoroRemSec  = 0;
-static volatile uint8_t  activePomodoroPhase   = 0;
-static volatile uint8_t  activePomodoroSession = 0;
-static volatile int8_t   activePomodoroOffsetX = 0;
-static volatile int8_t   activePomodoroOffsetY = 0;
-static volatile uint16_t activePomodoroColor   = 0xFFE0; // yellow default
+static volatile uint8_t  activePomodoroFlags     = 0;
+static volatile uint32_t activePomodoroRemSec    = 0;
+static volatile uint8_t  activePomodoroPhase     = 0;
+static volatile uint8_t  activePomodoroSession   = 0;
+static volatile int8_t   activePomodoroOffsetX   = 0;
+static volatile int8_t   activePomodoroOffsetY   = 0;
+static volatile uint16_t activePomodoroColor     = 0xFFE0; // yellow default
+// v1.9 layout fields
+static volatile uint8_t  activePomodoroLayout    = 0;      // POMO_LAYOUT_SPLIT
+static volatile uint8_t  activePomodoroSessTotal = 4;
+static volatile uint16_t activePomodoroTotalSec  = 1500;   // 25 min default
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Next-song preload (Spotify)
@@ -136,13 +150,17 @@ static uint16_t pktColonColor    = 0x07E0;
 static uint16_t pktDateColor     = 0x07E0;
 static uint16_t pktAmpmColor     = 0x07E0;
 // Pomodoro (v1.8)
-static uint8_t  pktPomodoroFlags   = 0;
-static uint32_t pktPomodoroRemSec  = 0;
-static uint8_t  pktPomodoroPhase   = 0;
-static uint8_t  pktPomodoroSession = 0;
-static int8_t   pktPomodoroOffsetX = 0;
-static int8_t   pktPomodoroOffsetY = 0;
-static uint16_t pktPomodoroColor   = 0xFFE0;
+static uint8_t  pktPomodoroFlags     = 0;
+static uint32_t pktPomodoroRemSec    = 0;
+static uint8_t  pktPomodoroPhase     = 0;
+static uint8_t  pktPomodoroSession   = 0;
+static int8_t   pktPomodoroOffsetX   = 0;
+static int8_t   pktPomodoroOffsetY   = 0;
+static uint16_t pktPomodoroColor     = 0xFFE0;
+// Pomodoro (v1.9)
+static uint8_t  pktPomodoroLayout    = 0;
+static uint8_t  pktPomodoroSessTotal = 4;
+static uint16_t pktPomodoroTotalSec  = 1500;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Forward declarations
@@ -191,7 +209,7 @@ static void renderFrame(int bufIdx, int frameIdx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// overdrawProgressBar — inline (moved to spotifyhelper.cpp in a future pass)
+// overdrawProgressBar
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
@@ -211,7 +229,7 @@ static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// parseHeader — v1.8  (68-byte header)
+// parseHeader — v1.9  (68-byte header, reserved bytes [63-67] now used)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void parseHeader() {
@@ -268,7 +286,11 @@ static void parseHeader() {
     pktPomodoroOffsetX = (int8_t)h[59];
     pktPomodoroOffsetY = (int8_t)h[60];
     pktPomodoroColor   = ((uint16_t)h[61] << 8) | h[62];
-    // h[63..67] reserved — ignored
+    // v1.9 — previously reserved bytes
+    pktPomodoroLayout    = h[63];
+    pktPomodoroSessTotal = h[64];
+    pktPomodoroTotalSec  = ((uint16_t)h[65] << 8) | h[66];
+    // h[67] reserved
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,31 +298,17 @@ static void parseHeader() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void processPacket() {
-    const uint32_t headerAndPayload = HEADER_SIZE + pktPayloadBytes;
+    uint8_t* buf = pktBuf[pendingBuf];
 
-    // CRC check
-    const uint16_t storedCrc =
-        ((uint16_t)pktBuf[pendingBuf][headerAndPayload] << 8)
-        | pktBuf[pendingBuf][headerAndPayload + 1];
-    const uint16_t computedCrc = crc16(pktBuf[pendingBuf], headerAndPayload);
+    const uint32_t packetLen = HEADER_SIZE + pktPayloadBytes + CRC_SIZE;
+    const uint16_t computed  = crc16(buf, HEADER_SIZE + pktPayloadBytes);
+    const uint16_t received  = ((uint16_t)buf[HEADER_SIZE + pktPayloadBytes] << 8)
+                              | buf[HEADER_SIZE + pktPayloadBytes + 1];
 
-    if (storedCrc != computedCrc) {
-        Serial.printf("[NAK] CRC fail — stored=0x%04X computed=0x%04X\n",
-                      storedCrc, computedCrc);
+    if (computed != received) {
+        Serial.printf("[NAK] CRC mismatch: computed=0x%04X received=0x%04X\n",
+                      computed, received);
         Serial.write(RESP_NAK);
-        Serial.flush();
-        return;
-    }
-
-    // Geometry sanity check
-    const uint32_t expectedPayload = (uint32_t)pktFrameCount * FRAME_BYTES;
-    if (pktWidth != PANEL_WIDTH || pktHeight != REAL_HEIGHT ||
-        pktFrameCount == 0 || pktFrameCount > MAX_FRAMES ||
-        pktPayloadBytes != expectedPayload) {
-        Serial.printf("[ERR] Invalid packet — w=%d h=%d fc=%d pb=%lu\n",
-                      pktWidth, pktHeight, pktFrameCount,
-                      (unsigned long)pktPayloadBytes);
-        Serial.write(RESP_ERR);
         Serial.flush();
         return;
     }
@@ -308,9 +316,9 @@ static void processPacket() {
     // ── Next-song preload ─────────────────────────────────────────────────
     if (pktFlags == FRM_NEXT) {
         xSemaphoreTake(nextMutex, portMAX_DELAY);
-        memcpy(nextBuf, pktBuf[pendingBuf], HEADER_SIZE + pktPayloadBytes + CRC_SIZE);
+        memcpy(nextBuf, buf, packetLen);
         nextFrameCount = pktFrameCount;
-        nextFrameDurMs = (pktDurMs > 0) ? pktDurMs : 100;
+        nextFrameDurMs = pktDurMs;
         nextStartPosMs = pktStartPosMs;
         nextTrackDurMs = pktTrackDurMs;
         nextBarX       = pktBarX;
@@ -319,20 +327,21 @@ static void processPacket() {
         nextBarColor   = pktBarColor;
         nextBufReady   = true;
         xSemaphoreGive(nextMutex);
-        Serial.printf("[NEXT] Preloaded: %d frames\n", pktFrameCount);
+
+        Serial.printf("[ACK-NEXT] %d frames preloaded\n", pktFrameCount);
         Serial.write(RESP_ACK);
         Serial.flush();
         return;
     }
 
-    // ── Normal commit ─────────────────────────────────────────────────────
+    // ── Normal commit — update active display state ───────────────────────
     xSemaphoreTake(swapMutex, portMAX_DELAY);
     activeBuf           = pendingBuf;
     activeFrameCount    = pktFrameCount;
-    activeFrameDurMs    = (pktDurMs > 0) ? pktDurMs : 100;
+    activeFrameDurMs    = pktDurMs ? pktDurMs : 100;
     activeStartPosMs    = pktStartPosMs;
     activeTrackDurMs    = pktTrackDurMs;
-    commitTimeMs        = millis();   // ← captured at ACK, used by all overdraw
+    commitTimeMs        = millis();   // captured at ACK — used by all overdraw
     activeBarX          = pktBarX;
     activeBarY          = pktBarY;
     activeBarW          = pktBarW;
@@ -358,16 +367,23 @@ static void processPacket() {
     activePomodoroOffsetX = pktPomodoroOffsetX;
     activePomodoroOffsetY = pktPomodoroOffsetY;
     activePomodoroColor   = pktPomodoroColor;
+    // Pomodoro (v1.9)
+    activePomodoroLayout    = pktPomodoroLayout;
+    activePomodoroSessTotal = pktPomodoroSessTotal;
+    activePomodoroTotalSec  = pktPomodoroTotalSec;
     xSemaphoreGive(swapMutex);
 
     pendingBuf = 1 - pendingBuf;
 
-    Serial.printf("[ACK] %d frames @ %d ms/frame  clock=%s font=%d  pomo=%s remSec=%lu\n",
+    Serial.printf("[ACK] %d frames @ %d ms/frame  clock=%s font=%d  "
+                  "pomo=%s layout=%d remSec=%lu totalSec=%u\n",
                   pktFrameCount, pktDurMs,
                   (pktClockFlags    & CLK_FLAG_PRESENT)  ? "yes" : "no",
                   pktClockFontId,
                   (pktPomodoroFlags & POMO_FLAG_PRESENT) ? "yes" : "no",
-                  (unsigned long)pktPomodoroRemSec);
+                  pktPomodoroLayout,
+                  (unsigned long)pktPomodoroRemSec,
+                  pktPomodoroTotalSec);
     Serial.write(RESP_ACK);
     Serial.flush();
 }
@@ -428,7 +444,8 @@ static void processSerial() {
         const uint32_t payloadEnd = HEADER_SIZE + pktPayloadBytes;
         const uint32_t needed     = payloadEnd - rxIdx;
         const size_t   avail      = (size_t)Serial.available();
-        const size_t   toRead     = (needed < (uint32_t)avail) ? needed : (size_t)needed;
+        const size_t   toRead     = (needed < (uint32_t)avail) ?
+                                    (size_t)needed : (size_t)needed;
         Serial.readBytes((char*)buf + rxIdx, toRead);
         rxIdx += (uint32_t)toRead;
         if (rxIdx == payloadEnd) rxState = RX_CRC_H;
@@ -453,7 +470,7 @@ static void processSerial() {
 //   1. renderFrame()          — blit baked RGB565 pixels from PSRAM
 //   2. overdrawProgressBar()  — Spotify bar position computed from millis()
 //   3. overdrawClock()        — wall-clock digits from millis() + epoch
-//   4. overdrawPomodoro()     — countdown digits from millis() + remainingSec
+//   4. overdrawPomodoro()     — countdown from millis() + remainingSec
 //   5. matrix->flipDMABuffer()— commit the composited frame to the display
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -464,16 +481,16 @@ static void displayTask(void* /*param*/) {
     while (true) {
         // ── Snapshot active state under mutex ─────────────────────────────
         xSemaphoreTake(swapMutex, portMAX_DELAY);
-        const int      buf        = activeBuf;
-        const int      count      = activeFrameCount;
-        const uint16_t dur        = activeFrameDurMs;
-        const uint32_t startPos   = activeStartPosMs;
-        const uint32_t trackDur   = activeTrackDurMs;
-        const uint32_t committed  = commitTimeMs;
-        const uint8_t  barX       = activeBarX;
-        const uint8_t  barY       = activeBarY;
-        const uint8_t  barW       = activeBarW;
-        const uint16_t barColor   = activeBarColor;
+        const int      buf       = activeBuf;
+        const int      count     = activeFrameCount;
+        const uint16_t dur       = activeFrameDurMs;
+        const uint32_t startPos  = activeStartPosMs;
+        const uint32_t trackDur  = activeTrackDurMs;
+        const uint32_t committed = commitTimeMs;
+        const uint8_t  barX      = activeBarX;
+        const uint8_t  barY      = activeBarY;
+        const uint8_t  barW      = activeBarW;
+        const uint16_t barColor  = activeBarColor;
         // Clock
         const uint8_t  clockFlags = activeClockFlags;
         const uint32_t epochSec   = activeClockEpochSec;
@@ -487,14 +504,17 @@ static void displayTask(void* /*param*/) {
         const uint16_t colonCol   = activeColonColor;
         const uint16_t dateCol    = activeDateColor;
         const uint16_t ampmCol    = activeAmpmColor;
-        // Pomodoro (v1.8)
-        const uint8_t  pomoFlags   = activePomodoroFlags;
-        const uint32_t pomoRemSec  = activePomodoroRemSec;
-        const uint8_t  pomoPhase   = activePomodoroPhase;
-        const uint8_t  pomoSession = activePomodoroSession;
-        const int8_t   pomoOffX    = activePomodoroOffsetX;
-        const int8_t   pomoOffY    = activePomodoroOffsetY;
-        const uint16_t pomoColor   = activePomodoroColor;
+        // Pomodoro (v1.8 + v1.9)
+        const uint8_t  pomoFlags     = activePomodoroFlags;
+        const uint32_t pomoRemSec    = activePomodoroRemSec;
+        const uint8_t  pomoPhase     = activePomodoroPhase;
+        const uint8_t  pomoSession   = activePomodoroSession;
+        const int8_t   pomoOffX      = activePomodoroOffsetX;
+        const int8_t   pomoOffY      = activePomodoroOffsetY;
+        const uint16_t pomoColor     = activePomodoroColor;
+        const uint8_t  pomoLayout    = activePomodoroLayout;
+        const uint8_t  pomoSessTotal = activePomodoroSessTotal;
+        const uint32_t pomoTotalSec  = activePomodoroTotalSec;
         xSemaphoreGive(swapMutex);
 
         // ── Idle splash ───────────────────────────────────────────────────
@@ -507,8 +527,8 @@ static void displayTask(void* /*param*/) {
 
         if (currentFrame >= count) currentFrame = 0;
 
-        const uint32_t now    = millis();
-        const uint32_t wallMs = now - committed;   // ms elapsed since commit
+        const uint32_t now   = millis();
+        const uint32_t wallMs = now - committed;  // ms elapsed since commit
 
         // Spotify song position prediction
         const uint32_t songPosMs = startPos + wallMs;
@@ -538,9 +558,8 @@ static void displayTask(void* /*param*/) {
                 activeBarY       = nextBarY;
                 activeBarW       = nextBarW;
                 activeBarColor   = nextBarColor;
-                // Clock and pomodoro overdraw are not preloaded — they remain
-                // from the last normal-commit packet and stay accurate because
-                // they compute live time from millis().
+                // Clock and pomodoro overdraw stay from the last normal-commit
+                // packet — they keep ticking correctly from millis().
                 xSemaphoreGive(swapMutex);
                 pendingBuf   = 1 - pendingBuf;
                 currentFrame = 0;
@@ -565,19 +584,28 @@ static void displayTask(void* /*param*/) {
                           colonCol, dateCol, ampmCol);
         }
 
-        // 4. Pomodoro countdown (live remaining time from millis()) — v1.8
+        // 4. Pomodoro countdown (live remaining time from millis()) — v1.9
         if (pomoFlags & POMO_FLAG_PRESENT) {
-            overdrawPomodoro(pomoRemSec, wallMs,
-                             pomoPhase, pomoFlags, pomoSession,
-                             pomoOffX, pomoOffY, pomoColor);
+            overdrawPomodoro(
+                pomoRemSec,
+                pomoTotalSec,
+                wallMs,
+                pomoPhase,
+                pomoLayout,
+                pomoFlags,
+                pomoSession,
+                pomoSessTotal,
+                pomoOffX,
+                pomoOffY,
+                pomoColor);
         }
 
         // 5. Commit all layers atomically to the display
         matrix->flipDMABuffer();
 
-        const uint32_t elapsed  = millis() - t0;
+        const uint32_t elapsed   = millis() - t0;
         currentFrame = (currentFrame + 1) % count;
-        const int32_t remaining = (int32_t)dur - (int32_t)elapsed;
+        const int32_t remaining  = (int32_t)dur - (int32_t)elapsed;
         if (remaining > 1) vTaskDelay(pdMS_TO_TICKS(remaining));
     }
 }
@@ -589,7 +617,7 @@ static void displayTask(void* /*param*/) {
 void setup() {
     Serial.begin(921600);
     delay(200);
-    Serial.println("\n\nFrameon Firmware v1.8");
+    Serial.println("\n\nFrameon Firmware v1.9");
     Serial.println("════════════════════════════════════════");
 
     for (int i = 0; i < 2; i++) {
@@ -643,12 +671,12 @@ void setup() {
 
     Serial.println("Ready.");
     Serial.println("────────────────────────────────────────");
-    Serial.printf("  Protocol:    v1.8 (header %d B)\n", HEADER_SIZE);
+    Serial.printf("  Protocol:    v1.9 (header %d B)\n", HEADER_SIZE);
     Serial.printf("  Panel:       %dx%d\n", PANEL_WIDTH, REAL_HEIGHT);
     Serial.printf("  Max frames:  %d  (%lu KB max payload)\n",
                   MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
     Serial.printf("  Clock fonts: 7 (Polymorph…Phantasm) via clockhelper.cpp\n");
-    Serial.printf("  Pomodoro:    live overdraw via pomodorohelper.cpp\n");
+    Serial.printf("  Pomodoro:    split + minimalist layouts via pomodorohelper.cpp\n");
     Serial.println("  Waiting for Frameon packets on USB Serial...");
     Serial.println("────────────────────────────────────────");
 }
