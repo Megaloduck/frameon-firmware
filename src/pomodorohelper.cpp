@@ -201,12 +201,12 @@ static void overdrawSplit(
 // ─────────────────────────────────────────────────────────────────────────────
 // Layout: POMO_LAYOUT_MINIMALIST
 //
-// Large minutes (scale-2) at x=2, y=9.
-// Vertical bar x=61–63, barTop=3, barBot=28 — drains bottom-up with progress.
+// Large minute digits (scale-2) on the left, top area.
+// Large seconds (scale-2) on bottom left with 1px margin.
+// Vertical bar x=61-63, barTop=3, barBot=28 — drains bottom-up with progress.
 //   Filled pixels use activeColor; unfilled use 15% dimmed activeColor.
-// Session dots: up to 8 total, 2×2 px, top row (y=0–1), right→left from x=58.
+// Session dots: up to 8 total, 2×2 px, top row (y=0-1), right→left from x=58.
 //   Active/done dots use activeColor; future dots 18% dimmed.
-// Small seconds (if showSec): dim text bottom-right, just left of bar.
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void overdrawMinimalist(
@@ -218,15 +218,25 @@ static void overdrawMinimalist(
     uint8_t  sessionsTotal,
     uint16_t activeColor)
 {
-    // ── Large minutes ────────────────────────────────────────────────────
+    // ── Small minutes label (top left) ───────────────────────────────────
     char mBuf[4];
     snprintf(mBuf, sizeof(mBuf), "%02lu", (unsigned long)(liveSec / 60));
-    pomoDrawTextScale2(mBuf, 2, 9, activeColor);
+    pomoDrawText(mBuf, 1, 9, activeColor);   // normal scale, x=1, y=9
+
+    // ── Large seconds (bottom left, 1px margin) ──────────────────────────
+    if (showSec) {
+        char sBuf[4];
+        snprintf(sBuf, sizeof(sBuf), "%02lu", (unsigned long)(liveSec % 60));
+        // For 32px height: 32 - 14 (scale-2 height) - 1 = 17
+        // For 64px height: 64 - 14 - 1 = 49
+        const int secondsY = REAL_HEIGHT - 14 - 1;
+        pomoDrawTextScale2(sBuf, 1, secondsY, activeColor);
+    }
 
     // ── Vertical bar ─────────────────────────────────────────────────────
     const int barX   = 61;
-    const int barTop = 3;
-    const int barBot = 28;
+    const int barTop = 1;  
+    const int barBot = 31;
     const int barH   = barBot - barTop;
     const int filled = (int)(progress * (float)barH + 0.5f);
     const uint16_t dimBar = dimColor565(activeColor, 38); // ~15%
@@ -236,7 +246,6 @@ static void overdrawMinimalist(
         uint16_t c = on ? activeColor : dimBar;
         matrix->drawPixel(barX,     y, c);
         matrix->drawPixel(barX + 1, y, c);
-        matrix->drawPixel(barX + 2, y, c);
     }
 
     // ── Session dots ──────────────────────────────────────────────────────
@@ -248,22 +257,11 @@ static void overdrawMinimalist(
             bool active = (i == (int)(session - 1));
             bool done   = (i <  (int)(session - 1));
             uint16_t dc = (active || done) ? activeColor : dimDot;
-            matrix->drawPixel(dotX,     0, dc);
-            matrix->drawPixel(dotX + 1, 0, dc);
             matrix->drawPixel(dotX,     1, dc);
             matrix->drawPixel(dotX + 1, 1, dc);
+            matrix->drawPixel(dotX,     2, dc);
+            matrix->drawPixel(dotX + 1, 2, dc);
         }
-    }
-
-    // ── Small seconds ────────────────────────────────────────────────────
-    if (showSec) {
-        char sBuf[4];
-        snprintf(sBuf, sizeof(sBuf), "%02lu", (unsigned long)(liveSec % 60));
-        const int sw  = pomoTextWidth(sBuf);
-        const int sx  = barX - sw - 2;
-        const int sy  = REAL_HEIGHT - 7 - 1;
-        const uint16_t dimSec = dimColor565(activeColor, 128); // ~50%
-        pomoDrawText(sBuf, sx, sy, dimSec);
     }
 }
 
