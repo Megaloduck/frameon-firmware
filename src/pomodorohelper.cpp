@@ -1,21 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// pomodorohelper.cpp — Live Pomodoro timer overdraw renderer (v1.9)
+// pomodorohelper.cpp — Live Pomodoro timer overdraw renderer (v1.10)
 //
-// v1.9 — Layout overdraw support.
-//        Adds overdrawSplit() and overdrawMinimalist() to match the two new
-//        PomodoroLayout options in the Dart app.
+// v1.10 — Fixed phase label rendering in splitLayout.
+//         kPolymorph expanded from 12 (digits + ':' + space) to 22 entries,
+//         adding the 10 uppercase letters needed for the phase labels:
+//           B C E F K O R S T U  →  "FOCUS", "BRK", "REST"
+//         pomoGlyphIndex() updated to map these letters to the new slots.
+//         Bitmaps copied verbatim from lib/engine/renderer/fonts/polymorph_font.dart
+//         so the panel matches the app preview pixel-for-pixel.
 //
-//        overdrawSplit      — hollow arc ring (r=11, ring width=4) on left
-//                             half (cx=14), MM:SS + dim phase label stacked
-//                             on right half (centred at x=46).
-//
-//        overdrawMinimalist — scale-2 minute digits on left (x=2, y=9),
-//                             3-px vertical bar on far right (x=61) draining
-//                             bottom-up, session dots top-right as 2×2 px
-//                             squares, small dim seconds bottom-right.
-//
-// Both paths share the same liveSec / blink guard computed at the top of
-// overdrawPomodoro() so timing behaviour is identical to v1.8.
+// v1.9 — Layout overdraw support (splitLayout / minimalist).
+// v1.8 — Initial Pomodoro live overdraw via millis().
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "pomodorohelper.h"
@@ -27,40 +22,88 @@
 extern MatrixPanel_I2S_DMA* matrix;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Polymorph font table (matches clockhelper.cpp and Dart LedFontId.polymorph)
+// Polymorph glyph table
 //
-// Index mapping: 0-9 → digits, 10 → ':', 11 → ' ' blank
+// Index mapping:
+//   0-9  → '0'-'9'
+//   10   → ':'
+//   11   → ' '  (blank / fallback)
+//   12   → 'B'
+//   13   → 'C'
+//   14   → 'E'
+//   15   → 'F'
+//   16   → 'K'
+//   17   → 'O'
+//   18   → 'R'
+//   19   → 'S'
+//   20   → 'T'
+//   21   → 'U'
+//
+// Bitmaps from lib/engine/renderer/fonts/polymorph_font.dart.
+// Each row is a bitmask — MSB = leftmost pixel, w bits wide.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct PomoGlyph { uint8_t w; uint8_t rows[7]; };
 
-static const PomoGlyph kPolymorph[12] = {
-    {5, {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}}, // 0
-    {5, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}}, // 1
-    {5, {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}}, // 2
-    {5, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}}, // 3
-    {5, {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}}, // 4
-    {5, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}}, // 5
-    {5, {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}}, // 7
-    {5, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, // 8
-    {5, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}}, // 9
-    {2, {0x00,0x03,0x03,0x00,0x03,0x03,0x00}}, // : (index 10)
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' ' blank (index 11)
+static const PomoGlyph kPolymorph[23] = {
+    // ── Digits ───────────────────────────────────────────────────────────
+    {5, {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}}, //  0 → '0'
+    {5, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}}, //  1 → '1'
+    {5, {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}}, //  2 → '2'
+    {5, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}}, //  3 → '3'
+    {5, {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}}, //  4 → '4'
+    {5, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}}, //  5 → '5'
+    {5, {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}}, //  6 → '6'
+    {5, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}}, //  7 → '7'
+    {5, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, //  8 → '8'
+    {5, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}}, //  9 → '9'
+    // ── Punctuation ──────────────────────────────────────────────────────
+    {2, {0x00,0x03,0x03,0x00,0x03,0x03,0x00}}, // 10 → ':'
+    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // 11 → ' ' blank / fallback
+    // ── Letters for phase labels (FOCUS, BREAK, REST) ───────────────────────
+    {5, {0x1E,0x09,0x09,0x0E,0x09,0x09,0x1E}}, // 12 → 'B'
+    {5, {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}}, // 13 → 'C'
+    {5, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}}, // 14 → 'E'
+    {5, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}}, // 15 → 'F'   
+    {5, {0x11,0x12,0x14,0x18,0x14,0x12,0x11}}, // 16 → 'K'
+    {5, {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}}, // 17 → 'O'
+    {5, {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}}, // 18 → 'R'
+    {5, {0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E}}, // 19 → 'S'
+    {5, {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}}, // 20 → 'T'
+    {5, {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}}, // 21 → 'U'
+    {5, {0x04,0x0A,0x11,0x11,0x1F,0x11,0x11}} // 22→ 'A'
 };
 
-// Phase label strings — match Dart _phaseLabel()
-static const char* kPhaseLabel[3] = { "FOCUS", "BRK", "REST" };
+// Phase label strings — must match Dart _phaseLabel() in pomodoro_widget.dart
+static const char* kPhaseLabel[3] = { "FOCUS", "BREAK", "REST" };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Font helpers
+// Glyph index lookup
 // ─────────────────────────────────────────────────────────────────────────────
 
 static int pomoGlyphIndex(char c) {
     if (c >= '0' && c <= '9') return c - '0';
-    if (c == ':') return 10;
-    return 11;
+    if (c == ':')  return 10;
+    // Uppercase letters needed for phase labels
+    switch (c) {
+        case 'B': return 12;
+        case 'C': return 13;
+        case 'E': return 14;
+        case 'F': return 15;
+        case 'K': return 16;
+        case 'O': return 17;
+        case 'R': return 18;
+        case 'S': return 19;
+        case 'T': return 20;
+        case 'U': return 21;
+        case 'A':  return 22; 
+        default:  return 11; // blank fallback
+    }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Font helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 static int pomoGlyphWidth(char c) {
     return kPolymorph[pomoGlyphIndex(c)].w + 1; // +1 inter-character gap
@@ -91,8 +134,7 @@ static void pomoDrawText(const char* s, int x, int y, uint16_t color) {
 }
 
 // Scale-2 text: each pixel becomes a 2×2 block.
-// Only digits and ':' / ' ' are ever passed here so the glyph table covers
-// everything needed.
+// Only digits and ':' / ' ' are ever passed here.
 static void pomoDrawTextScale2(const char* s, int x, int y, uint16_t color) {
     while (*s) {
         const PomoGlyph& g = kPolymorph[pomoGlyphIndex(*s)];
@@ -112,7 +154,7 @@ static void pomoDrawTextScale2(const char* s, int x, int y, uint16_t color) {
     }
 }
 
-// Dim a RGB565 colour to `frac` of its brightness (0–256 range, 256=full).
+// Dim a RGB565 colour to `frac/256` of its brightness (0=black, 256=full).
 static uint16_t dimColor565(uint16_t c, int frac) {
     int r = ((c >> 11) & 0x1F) * frac >> 8;
     int g = ((c >>  5) & 0x3F) * frac >> 8;
@@ -128,14 +170,14 @@ static uint16_t dimColor565(uint16_t c, int frac) {
 //   Arc starts at top (−π/2), sweeps clockwise by progress × 2π.
 //   Filled sector uses activeColor; unfilled uses 18% dimmed activeColor.
 //
-// Right half (x 28–63): MM:SS centred at x=46, top half of right area.
-//   Phase label ("FOCUS"/"BRK"/"REST") centred at x=46, below time.
+// Right half (x 28–63): MM:SS centred at x=46, upper half of right area.
+//   Phase label ("FOCUS"/"BREAK"/"REST") centred at x=46, one lineHeight below.
 //   Phase label drawn at 35% brightness.
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void overdrawSplit(
     uint32_t liveSec,
-    float    progress,        // 0.0 – 1.0, elapsed fraction
+    float    progress,
     bool     colonVisible,
     bool     showSec,
     uint8_t  phase,
@@ -143,23 +185,21 @@ static void overdrawSplit(
 {
     const int cx = 14, cy = 16;
     const int outerR = 11, innerR = 7;
-    const uint16_t dimArc = dimColor565(activeColor, 46);  // ~18%
+    const uint16_t dimArc = dimColor565(activeColor, 46); // ~18%
 
     const float startAngle = -(float)M_PI / 2.0f;
     const float sweepEnd   = startAngle + progress * 2.0f * (float)M_PI;
 
-    // Rasterise the ring pixel-by-pixel.
+    // ── Arc ring ─────────────────────────────────────────────────────────
     for (int py = cy - outerR; py <= cy + outerR; py++) {
         for (int px2 = cx - outerR; px2 <= cx + outerR; px2++) {
-            float dx2 = (float)(px2 - cx);
-            float dy2 = (float)(py - cy);
+            float dx2  = (float)(px2 - cx);
+            float dy2  = (float)(py  - cy);
             float dist = sqrtf(dx2*dx2 + dy2*dy2);
             if (dist < (float)innerR || dist > (float)outerR) continue;
 
-            float angle = atan2f(dy2, dx2);
-
-            // Normalise angle relative to start so we can compare to sweep.
-            float norm = angle - startAngle;
+            float angle   = atan2f(dy2, dx2);
+            float norm    = angle - startAngle;
             if (norm < 0.0f) norm += 2.0f * (float)M_PI;
             float normEnd = sweepEnd - startAngle;
             if (normEnd < 0.0f) normEnd += 2.0f * (float)M_PI;
@@ -169,7 +209,7 @@ static void overdrawSplit(
         }
     }
 
-    // MM:SS centred at x=46, upper half of right area.
+    // ── MM:SS (right half, centred at x=46) ──────────────────────────────
     char timeBuf[8];
     uint32_t m = liveSec / 60;
     uint32_t s = liveSec % 60;
@@ -184,29 +224,30 @@ static void overdrawSplit(
     const int charH = 7;
     const int tw    = pomoTextWidth(timeBuf);
     const int tx    = 46 - tw / 2;
-    const int ty    = REAL_HEIGHT / 2 - charH - 1; // row 8 for 32-high panel
+    const int ty    = REAL_HEIGHT / 2 - charH - 1; // row 8 for 32-px-tall panel
 
     pomoDrawText(timeBuf, tx, ty, activeColor);
 
-    // Phase label at 35% brightness, one lineHeight below time (7+1=8 px).
-    const char* label   = (phase < 3) ? kPhaseLabel[phase] : "?";
-    const int   lw      = pomoTextWidth(label);
-    const int   lx      = 46 - lw / 2;
-    const int   ly      = ty + charH + 1;
-    const uint16_t dimLabel = dimColor565(activeColor, 90); // ~35%
+    // ── Phase label (full brightness, one lineHeight below time) ──────────
+    // kPhaseLabel uses only letters in our extended table (B,C,E,F,K,O,R,S,T,U,A)
+    // so pomoGlyphIndex() now resolves them correctly.
+    const char* label = (phase < 3) ? kPhaseLabel[phase] : "?";
+    const int   lw    = pomoTextWidth(label);
+    const int   lx    = 46 - lw / 2;
+    const int   ly    = ty + charH + 1; // one lineHeight (7+1=8 px) below time
 
-    pomoDrawText(label, lx, ly, dimLabel);
+    pomoDrawText(label, lx, ly, activeColor);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Layout: POMO_LAYOUT_MINIMALIST
 //
-// Large minute digits (scale-2) on the left, top area.
-// Large seconds (scale-2) on bottom left with 1px margin.
-// Vertical bar x=61-63, barTop=3, barBot=28 — drains bottom-up with progress.
-//   Filled pixels use activeColor; unfilled use 15% dimmed activeColor.
-// Session dots: up to 8 total, 2×2 px, top row (y=0-1), right→left from x=58.
-//   Active/done dots use activeColor; future dots 18% dimmed.
+// Small MM label   — normal scale at (2, 1), always visible.
+// Large SS         — scale-2 at (2, 9), behind POMO_FLAG_SECONDS.
+// Vertical bar     — 2 px wide at x=62..63, y=1..30, drains bottom-up.
+//                    Filled = activeColor; unfilled = 15% dim.
+// Session dots     — 2×2 px, y=1..2, right→left from x=58, if showDots.
+//                    Active/done = activeColor; future = 18% dim.
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void overdrawMinimalist(
@@ -218,45 +259,42 @@ static void overdrawMinimalist(
     uint8_t  sessionsTotal,
     uint16_t activeColor)
 {
-    // ── Small minutes label (top left) ───────────────────────────────────
+    // ── Small minutes label (top-left, above big seconds) ────────────────
     char mBuf[4];
     snprintf(mBuf, sizeof(mBuf), "%02lu", (unsigned long)(liveSec / 60));
-    pomoDrawText(mBuf, 1, 9, activeColor);   // normal scale, x=1, y=9
+    pomoDrawText(mBuf, 2, 1, activeColor);
 
-    // ── Large seconds (bottom left, 1px margin) ──────────────────────────
+    // ── Large seconds (scale-2, at y=9) ──────────────────────────────────
     if (showSec) {
         char sBuf[4];
         snprintf(sBuf, sizeof(sBuf), "%02lu", (unsigned long)(liveSec % 60));
-        // For 32px height: 32 - 14 (scale-2 height) - 1 = 17
-        // For 64px height: 64 - 14 - 1 = 49
-        const int secondsY = REAL_HEIGHT - 14 - 1;
-        pomoDrawTextScale2(sBuf, 1, secondsY, activeColor);
+        pomoDrawTextScale2(sBuf, 2, 9, activeColor);
     }
 
-    // ── Vertical bar ─────────────────────────────────────────────────────
-    const int barX   = 61;
-    const int barTop = 1;  
+    // ── Vertical bar (x=62-63, 1px margins all sides) ────────────────────
+    const int barX   = 62;
+    const int barTop = 1;
     const int barBot = 31;
     const int barH   = barBot - barTop;
     const int filled = (int)(progress * (float)barH + 0.5f);
     const uint16_t dimBar = dimColor565(activeColor, 38); // ~15%
 
     for (int y = barTop; y < barBot; y++) {
-        bool on = (y >= barTop + barH - filled);
-        uint16_t c = on ? activeColor : dimBar;
+        bool     on = (y >= barTop + barH - filled);
+        uint16_t c  = on ? activeColor : dimBar;
         matrix->drawPixel(barX,     y, c);
         matrix->drawPixel(barX + 1, y, c);
     }
 
-    // ── Session dots ──────────────────────────────────────────────────────
+    // ── Session dots (y=1-2, 1px top margin, right→left from x=58) ───────
     if (showDots && sessionsTotal > 0) {
-        const int total = (sessionsTotal > 8) ? 8 : (int)sessionsTotal;
+        const int      total  = (sessionsTotal > 8) ? 8 : (int)sessionsTotal;
         const uint16_t dimDot = dimColor565(activeColor, 46); // ~18%
         for (int i = 0; i < total; i++) {
-            int dotX = 58 - i * 4; // right→left
-            bool active = (i == (int)(session - 1));
-            bool done   = (i <  (int)(session - 1));
-            uint16_t dc = (active || done) ? activeColor : dimDot;
+            int      dotX   = 58 - i * 4;
+            bool     active = (i == (int)(session - 1));
+            bool     done   = (i <  (int)(session - 1));
+            uint16_t dc     = (active || done) ? activeColor : dimDot;
             matrix->drawPixel(dotX,     1, dc);
             matrix->drawPixel(dotX + 1, 1, dc);
             matrix->drawPixel(dotX,     2, dc);
@@ -266,7 +304,7 @@ static void overdrawMinimalist(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// overdrawPomodoro — v1.9  (public entry point)
+// overdrawPomodoro — v1.10  (public entry point)
 // ─────────────────────────────────────────────────────────────────────────────
 
 void overdrawPomodoro(
@@ -310,9 +348,6 @@ void overdrawPomodoro(
         if (progress > 1.0f) progress = 1.0f;
     }
 
-    // offX / offY nudges — not applied to bar/arc but to text origin in
-    // the split layout. For minimalist, the whole composition shifts.
-    // (Kept simple: only text origins shift, structural elements are fixed.)
     (void)offX; (void)offY; // reserved for future use
 
     // ── Dispatch to layout renderer ───────────────────────────────────────
@@ -320,7 +355,7 @@ void overdrawPomodoro(
         overdrawMinimalist(liveSec, progress, showSec, showDots,
                            session, sessionsTotal, activeColor);
     } else {
-        // POMO_LAYOUT_SPLIT (default — also catches any unknown value)
+        // POMO_LAYOUT_SPLIT (default — also handles any unknown value)
         overdrawSplit(liveSec, progress, colonVisible, showSec,
                       phase, activeColor);
     }
