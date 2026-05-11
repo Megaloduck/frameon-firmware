@@ -64,6 +64,19 @@
 #define PIN_LAT    1
 #define PIN_OE    16
 
+// ─── KY-040 Rotary Encoder ───────────────────────────────────────────────────
+#define PIN_ENC_CLK  17   // CLK  → GPIO17  (digital in, interrupt-capable)
+#define PIN_ENC_DT   18   // DT   → GPIO18  (digital in)
+#define PIN_ENC_SW   21   // SW   → GPIO21  (digital in, active LOW, PULLUP)
+ 
+// ─── KY-023 Analog Joystick ──────────────────────────────────────────────────
+#define PIN_JOY_VRX   6   // VRx  → GPIO6   (ADC1_CH5 — 0-3.3 V)
+#define PIN_JOY_VRY   7   // VRy  → GPIO7   (ADC1_CH6 — 0-3.3 V)
+#define PIN_JOY_SW    8   // SW   → GPIO8   (digital in, active LOW, PULLUP)
+ 
+// ─── TTP223B Capacitive Touch Sensor ─────────────────────────────────────────
+#define PIN_TOUCH    47   // SIG  → GPIO47  (digital out HIGH when touched)
+
 // ─── Panel geometry ──────────────────────────────────────────────────────────
 #define PANEL_CHAIN         1
 #define DEFAULT_BRIGHTNESS  128

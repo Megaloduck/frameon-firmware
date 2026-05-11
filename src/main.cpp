@@ -1,28 +1,13 @@
 /*
- * Frameon Firmware v1.9
+ * Frameon Firmware v2.0
  * ESP32-S3  ·  P4-2121-64×32 HUB75E
  *
- * v1.9 — Pomodoro layout selection.
- *        overdrawPomodoro() now accepts layout, sessionsTotal, and totalSec
- *        so the panel renders the correct layout (splitLayout / minimalist)
- *        matching the app dropdown. Reserved bytes [63-67] in the 68-byte
- *        header are used — no header size change.
- *          [63]    pomodoroLayout    uint8    0=split  1=minimalist
- *          [64]    pomodoroSessTotal uint8    sessionsBeforeLongBreak
- *          [65-66] pomodoroTotalSec  uint16   total seconds in current phase
- *          [67]    reserved          0x00
- *
- * v1.8 — Pomodoro live overdraw.
- *        overdrawPomodoro() added to pomodorohelper.cpp renders the countdown
- *        live on Core 0 using millis(), identical pattern to the clock.
- *        Header expanded from 52 → 68 bytes to carry the pomodoro descriptor.
- *        Seconds now tick correctly on the panel independent of loop length.
- *
- * v1.7 — Clean architecture.
- *        overdrawClock() and all font tables moved to clockhelper.cpp.
- *
- * v1.6 — Full multi-font clock support.
- * v1.5 — Clock overdraw (live millis-based rendering).
+ * v2.0 — Hardware input modules.
+ *        KY-040 rotary encoder  → brightness control (CW/CCW ±8, long = reset).
+ *        KY-023 analog joystick → directional events, SW button.
+ *        TTP223B touch sensor   → tap / long-press events.
+ *        inputhelper.cpp runs as a FreeRTOS task on Core 1 (priority 1).
+ *        Events are queued and drained in loop() via inputApplyEvent().
  *
  * Architecture
  * ────────────
@@ -30,6 +15,9 @@
  *                          clock → overdraw pomodoro → flip DMA buffer.
  *   Core 1  loop()       — serial receive state machine; swaps pending buffer
  *                          into active slot under mutex on valid packet.
+ *   Core 1  inputTask    — polls KY-040 / KY-023 / TTP223B at 20 ms intervals;
+ *                          pushes InputEvent items into inputQueue.
+ *                          Spawned from setup() via inputTaskStart().
  */
 
 #include <Arduino.h>
@@ -38,6 +26,7 @@
 #include "clockhelper.h"
 #include "pomodorohelper.h"
 #include "waitingscreen.h"
+#include "inputhelper.h"
 
 MatrixPanel_I2S_DMA* matrix = nullptr;
 
@@ -89,11 +78,11 @@ static volatile uint8_t  activePomodoroPhase     = 0;
 static volatile uint8_t  activePomodoroSession   = 0;
 static volatile int8_t   activePomodoroOffsetX   = 0;
 static volatile int8_t   activePomodoroOffsetY   = 0;
-static volatile uint16_t activePomodoroColor     = 0xFFE0; // yellow default
+static volatile uint16_t activePomodoroColor     = 0xFFE0;
 // v1.9 layout fields
-static volatile uint8_t  activePomodoroLayout    = 0;      // POMO_LAYOUT_SPLIT
+static volatile uint8_t  activePomodoroLayout    = 0;       // POMO_LAYOUT_SPLIT
 static volatile uint8_t  activePomodoroSessTotal = 4;
-static volatile uint16_t activePomodoroTotalSec  = 1500;   // 25 min default
+static volatile uint16_t activePomodoroTotalSec  = 1500;    // 25 min default
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Next-song preload (Spotify)
@@ -185,7 +174,8 @@ static uint16_t crc16(const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         crc ^= (uint16_t)data[i] << 8;
         for (int j = 0; j < 8; j++) {
-            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+            crc = (crc & 0x8000) ?
+                  ((crc << 1) ^ 0x1021) : (crc << 1);
         }
     }
     return crc;
@@ -223,7 +213,8 @@ static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
     const uint16_t bgColor = 0x3186;
     for (int row = barY; row <= barY + 1; row++) {
         for (int x = 0; x < (int)barW; x++) {
-            matrix->drawPixel(barX + x, row, x < filled ? barColor : bgColor);
+            matrix->drawPixel(barX + x, row,
+                              x < filled ? barColor : bgColor);
         }
     }
 }
@@ -445,7 +436,7 @@ static void processSerial() {
         const uint32_t needed     = payloadEnd - rxIdx;
         const size_t   avail      = (size_t)Serial.available();
         const size_t   toRead     = (needed < (uint32_t)avail) ?
-                                    (size_t)needed : (size_t)needed;
+                                    (size_t)needed : (size_t)avail;
         Serial.readBytes((char*)buf + rxIdx, toRead);
         rxIdx += (uint32_t)toRead;
         if (rxIdx == payloadEnd) rxState = RX_CRC_H;
@@ -521,52 +512,12 @@ static void displayTask(void* /*param*/) {
         if (count == 0) {
             showWaitingScreen(millis() - taskStart);
             matrix->flipDMABuffer();
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(33));
             continue;
         }
 
+        // ── Reset frame counter if a new packet just arrived ──────────────
         if (currentFrame >= count) currentFrame = 0;
-
-        const uint32_t now   = millis();
-        const uint32_t wallMs = now - committed;  // ms elapsed since commit
-
-        // Spotify song position prediction
-        const uint32_t songPosMs = startPos + wallMs;
-
-        // ── Next-song preload swap ────────────────────────────────────────
-        if (trackDur > 0 && songPosMs >= trackDur - 10000UL) {
-            xSemaphoreTake(nextMutex, portMAX_DELAY);
-            const bool hasNext = nextBufReady;
-            xSemaphoreGive(nextMutex);
-            if (hasNext) {
-                xSemaphoreTake(nextMutex, portMAX_DELAY);
-                memcpy(pktBuf[pendingBuf], nextBuf, MAX_PACKET);
-                const int      nCount = nextFrameCount;
-                const uint16_t nDur   = nextFrameDurMs;
-                const uint32_t nStart = nextStartPosMs;
-                const uint32_t nTrack = nextTrackDurMs;
-                nextBufReady = false;
-                xSemaphoreGive(nextMutex);
-                xSemaphoreTake(swapMutex, portMAX_DELAY);
-                activeBuf        = pendingBuf;
-                activeFrameCount = nCount;
-                activeFrameDurMs = nDur;
-                activeStartPosMs = nStart;
-                activeTrackDurMs = nTrack;
-                commitTimeMs     = millis();
-                activeBarX       = nextBarX;
-                activeBarY       = nextBarY;
-                activeBarW       = nextBarW;
-                activeBarColor   = nextBarColor;
-                // Clock and pomodoro overdraw stay from the last normal-commit
-                // packet — they keep ticking correctly from millis().
-                xSemaphoreGive(swapMutex);
-                pendingBuf   = 1 - pendingBuf;
-                currentFrame = 0;
-                Serial.println("[NEXT] Next-song preload activated.");
-                continue;
-            }
-        }
 
         const uint32_t t0 = millis();
 
@@ -574,6 +525,8 @@ static void displayTask(void* /*param*/) {
         renderFrame(buf, currentFrame);
 
         // 2. Spotify progress bar (live position from millis())
+        const uint32_t wallMs   = millis() - committed;
+        const uint32_t songPosMs = startPos + wallMs;
         overdrawProgressBar(songPosMs, trackDur, barX, barY, barW, barColor);
 
         // 3. Clock (live wall time from millis() + epoch)
@@ -603,9 +556,9 @@ static void displayTask(void* /*param*/) {
         // 5. Commit all layers atomically to the display
         matrix->flipDMABuffer();
 
-        const uint32_t elapsed   = millis() - t0;
+        const uint32_t elapsed  = millis() - t0;
         currentFrame = (currentFrame + 1) % count;
-        const int32_t remaining  = (int32_t)dur - (int32_t)elapsed;
+        const int32_t remaining = (int32_t)dur - (int32_t)elapsed;
         if (remaining > 1) vTaskDelay(pdMS_TO_TICKS(remaining));
     }
 }
@@ -617,7 +570,7 @@ static void displayTask(void* /*param*/) {
 void setup() {
     Serial.begin(921600);
     delay(200);
-    Serial.println("\n\nFrameon Firmware v1.9");
+    Serial.println("\n\nFrameon Firmware v2.0");
     Serial.println("════════════════════════════════════════");
 
     for (int i = 0; i < 2; i++) {
@@ -667,6 +620,10 @@ void setup() {
     matrix->flipDMABuffer();
     Serial.println("Matrix OK.");
 
+    // ── Input modules (v2.0) ──────────────────────────────────────────────
+    inputInit();
+    inputTaskStart();
+
     xTaskCreatePinnedToCore(displayTask, "display", 8192, nullptr, 2, nullptr, 0);
 
     Serial.println("Ready.");
@@ -677,6 +634,7 @@ void setup() {
                   MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
     Serial.printf("  Clock fonts: 7 (Polymorph…Phantasm) via clockhelper.cpp\n");
     Serial.printf("  Pomodoro:    split + minimalist layouts via pomodorohelper.cpp\n");
+    Serial.printf("  Input:       KY-040 / KY-023 / TTP223B via inputhelper.cpp\n");
     Serial.println("  Waiting for Frameon packets on USB Serial...");
     Serial.println("────────────────────────────────────────");
 }
@@ -686,6 +644,14 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
+    // Serial receive (existing)
     processSerial();
+
+    // Drain input event queue and apply actions
+    InputEventType evt;
+    while (xQueueReceive(inputQueue, &evt, 0) == pdTRUE) {
+        inputApplyEvent(evt, matrix);
+    }
+
     vTaskDelay(1);
 }
