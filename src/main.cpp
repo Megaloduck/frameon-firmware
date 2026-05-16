@@ -1,12 +1,14 @@
 /*
- * Frameon Firmware v2.0
+ * Frameon Firmware v3.0
  * ESP32-S3  ·  P4-2121-64×32 HUB75E
  *
- * v2.0 — Hardware input modules.
- *        KY-040 rotary encoder  → brightness control (CW/CCW ±8, long = reset).
+ * v3.0 — Expanded hardware input modules.
+ *        2× KY-040 rotary encoders:
+ *          · ENC1 → brightness control (CW/CCW ±8, long = reset, press = mode)
+ *          · ENC2 → menu navigation / selection
  *        KY-023 analog joystick → directional events, SW button.
- *        TTP223B touch sensor   → tap / long-press events.
- *        inputhelper.cpp runs as a FreeRTOS task on Core 1 (priority 1).
+ *        5× SMD push buttons (BTN1–BTN5) → short / long-press events.
+ *        inputhelper.cpp runs as a FreeRTOS task on Core 1 (priority 2).
  *        Events are queued and drained in loop() via inputApplyEvent().
  *
  * Architecture
@@ -15,7 +17,7 @@
  *                          clock → overdraw pomodoro → flip DMA buffer.
  *   Core 1  loop()       — serial receive state machine; swaps pending buffer
  *                          into active slot under mutex on valid packet.
- *   Core 1  inputTask    — polls KY-040 / KY-023 / TTP223B at 20 ms intervals;
+ *   Core 1  inputTask    — polls 2× KY-040 / KY-023 / 5× buttons at 20 ms;
  *                          pushes InputEvent items into inputQueue.
  *                          Spawned from setup() via inputTaskStart().
  */
@@ -570,7 +572,7 @@ static void displayTask(void* /*param*/) {
 void setup() {
     Serial.begin(921600);
     delay(200);
-    Serial.println("\n\nFrameon Firmware v2.0");
+    Serial.println("\n\nFrameon Firmware v3.0");
     Serial.println("════════════════════════════════════════");
 
     for (int i = 0; i < 2; i++) {
@@ -620,7 +622,7 @@ void setup() {
     matrix->flipDMABuffer();
     Serial.println("Matrix OK.");
 
-    // ── Input modules (v2.0) ──────────────────────────────────────────────
+    // ── Input modules (v3.0) ──────────────────────────────────────────────
     inputInit();
     inputTaskStart();
 
@@ -634,7 +636,9 @@ void setup() {
                   MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
     Serial.printf("  Clock fonts: 7 (Polymorph…Phantasm) via clockhelper.cpp\n");
     Serial.printf("  Pomodoro:    split + minimalist layouts via pomodorohelper.cpp\n");
-    Serial.printf("  Input:       KY-040 / KY-023 / TTP223B via inputhelper.cpp\n");
+    Serial.printf("  Encoders:    2x KY-040 (ENC1=brightness, ENC2=menu)\n");
+    Serial.printf("  Joystick:    KY-023 (5-way + SW)\n");
+    Serial.printf("  Buttons:     5x SMD tactile (BTN1-BTN5)\n");
     Serial.println("  Waiting for Frameon packets on USB Serial...");
     Serial.println("────────────────────────────────────────");
 }
