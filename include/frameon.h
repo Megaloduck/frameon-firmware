@@ -90,7 +90,7 @@
 //   The RESET button connects to the dedicated EN pin (not a GPIO).
 //   Typical circuit: EN → 10kΩ pull-up to 3.3V, 100nF to GND, RESET switch to GND.
 
-/ ─── Panel geometry ──────────────────────────────────────────────────────────
+// ─── Panel geometry ──────────────────────────────────────────────────────────
 #define PANEL_CHAIN         1
 #define DEFAULT_BRIGHTNESS  128
 #define PANEL_WIDTH        64

@@ -223,13 +223,13 @@ static void clockClassic(const ClockTime& ct, uint32_t wallMs, uint8_t flags,
 
     drawText(hBuf, cx, startY, hCol);               cx += textWidth(hBuf) + 2;
     if (colonVis) drawGlyph(':', cx - 1, startY, cCol);
-    cx += colonW - 1;
+    cx += colonW;
     drawText(mBuf, cx, startY, mCol);               cx += textWidth(mBuf);
 
     if (showSec) {
         cx += 2;
         if (colonVis) drawGlyph(':', cx - 1, startY, cCol);
-        cx += colonW - 1;
+        cx += colonW;
         drawText(sBuf, cx, startY, sCol);           cx += textWidth(sBuf);
     }
     if (showAmPm && amBuf[0]) {
@@ -312,7 +312,7 @@ static void clockAnalog(const ClockTime& ct, uint8_t analogFlags,
         int cx = xStart;
         drawText(hBuf, cx, y, hCol);   cx += textWidth(hBuf) + 2;
         if (cv) drawGlyph(':', cx - 1, y, cCol);
-        cx += colonW - 1;
+        cx += colonW;
         drawText(mBuf, cx, y, mCol);
     }
 }
@@ -340,7 +340,7 @@ static void clockWeekdayPrefix(const ClockTime& ct, uint32_t wallMs,
     drawLabel(wd,   cx, y, lblCol); cx += wdW + 2;
     drawText(hBuf,  cx, y, hCol);   cx += textWidth(hBuf) + 2;
     if (cv) drawGlyph(':', cx - 1, y, cCol);
-    cx += colonW - 1;
+    cx += colonW;
     drawText(mBuf, cx, y, mCol);
 }
 
@@ -382,7 +382,7 @@ static void clockSecondsBar(const ClockTime& ct, uint32_t wallMs,
 
     drawText(hBuf, cx, startY, hCol);   cx += textWidth(hBuf) + 2;
     if (cv) drawGlyph(':', cx - 1, startY, cCol);
-    cx += colonW - 1;
+    cx += colonW;
     drawText(mBuf, cx, startY, mCol);
 
     const int barW   = 50;
@@ -417,7 +417,7 @@ static void clockDualTz(const ClockTime& ct1, const ClockTime& ct2,
         drawLabel(label, cx, y, lblCol); cx += lblW + 2;
         drawText(hBuf,   cx, y, hCol);   cx += textWidth(hBuf) + 2;
         if (cv) drawGlyph(':', cx - 1, y, cCol);
-        cx += colonW - 1;
+        cx += colonW;
         drawText(mBuf, cx, y, mCol);
     };
 

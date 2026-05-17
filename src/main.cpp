@@ -1,5 +1,5 @@
 /*
- * Frameon Firmware v3.0
+ * Frameon Firmware v3.0 — clock v1.6
  * ESP32-S3  ·  P4-2121-64×32 HUB75E
  *
  * v3.0 — Expanded hardware input modules.
@@ -10,6 +10,10 @@
  *        5× SMD push buttons (BTN1–BTN5) → short / long-press events.
  *        inputhelper.cpp runs as a FreeRTOS task on Core 1 (priority 2).
  *        Events are queued and drained in loop() via inputApplyEvent().
+ *
+ * Clock v1.6 — six layout styles (Classic / Analog / WeekdayPrefix /
+ *              Stacked / SecondsBar / DualTimezone), full A-Z alphabet in
+ *              all 7 fonts, 80-byte header (was 68). Protocol version 0x03.
  *
  * Architecture
  * ────────────
@@ -73,6 +77,13 @@ static volatile uint16_t activeColonColor    = 0x07E0;
 static volatile uint16_t activeDateColor     = 0x07E0;
 static volatile uint16_t activeAmpmColor     = 0x07E0;
 
+// Clock overdraw state (v1.6 extension)
+static volatile uint8_t  activeClockLayoutStyle = 0;   // CLK_LAYOUT_CLASSIC
+static volatile uint8_t  activeClockAnalogFlags = 0;
+static volatile int16_t  activeClockTz2Min      = 0;
+static char              activeClockLabel1[5]   = {0}; // mutex-protected
+static char              activeClockLabel2[5]   = {0};
+
 // Pomodoro overdraw state (v1.8)
 static volatile uint8_t  activePomodoroFlags     = 0;
 static volatile uint32_t activePomodoroRemSec    = 0;
@@ -82,9 +93,9 @@ static volatile int8_t   activePomodoroOffsetX   = 0;
 static volatile int8_t   activePomodoroOffsetY   = 0;
 static volatile uint16_t activePomodoroColor     = 0xFFE0;
 // v1.9 layout fields
-static volatile uint8_t  activePomodoroLayout    = 0;       // POMO_LAYOUT_SPLIT
+static volatile uint8_t  activePomodoroLayout    = 0;
 static volatile uint8_t  activePomodoroSessTotal = 4;
-static volatile uint16_t activePomodoroTotalSec  = 1500;    // 25 min default
+static volatile uint16_t activePomodoroTotalSec  = 1500;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Next-song preload (Spotify)
@@ -127,7 +138,8 @@ static uint8_t  pktBarX         = 0;
 static uint8_t  pktBarY         = 0;
 static uint8_t  pktBarW         = 0;
 static uint16_t pktBarColor     = 0x11C5;
-// Clock
+
+// Clock (v1.5)
 static uint8_t  pktClockFlags    = 0;
 static uint32_t pktClockEpochSec = 0;
 static int16_t  pktClockTzMin    = 0;
@@ -140,6 +152,14 @@ static uint16_t pktSecondsColor  = 0x07E0;
 static uint16_t pktColonColor    = 0x07E0;
 static uint16_t pktDateColor     = 0x07E0;
 static uint16_t pktAmpmColor     = 0x07E0;
+
+// Clock (v1.6 extension)
+static uint8_t  pktClockLayoutStyle = 0;
+static uint8_t  pktClockAnalogFlags = 0;
+static int16_t  pktClockTz2Min      = 0;
+static char     pktClockLabel1[5]   = {0};
+static char     pktClockLabel2[5]   = {0};
+
 // Pomodoro (v1.8)
 static uint8_t  pktPomodoroFlags     = 0;
 static uint32_t pktPomodoroRemSec    = 0;
@@ -148,6 +168,7 @@ static uint8_t  pktPomodoroSession   = 0;
 static int8_t   pktPomodoroOffsetX   = 0;
 static int8_t   pktPomodoroOffsetY   = 0;
 static uint16_t pktPomodoroColor     = 0xFFE0;
+
 // Pomodoro (v1.9)
 static uint8_t  pktPomodoroLayout    = 0;
 static uint8_t  pktPomodoroSessTotal = 4;
@@ -176,8 +197,7 @@ static uint16_t crc16(const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         crc ^= (uint16_t)data[i] << 8;
         for (int j = 0; j < 8; j++) {
-            crc = (crc & 0x8000) ?
-                  ((crc << 1) ^ 0x1021) : (crc << 1);
+            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
         }
     }
     return crc;
@@ -201,7 +221,7 @@ static void renderFrame(int bufIdx, int frameIdx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// overdrawProgressBar
+// overdrawProgressBar — Spotify 2-px bar, position from millis()
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
@@ -211,18 +231,17 @@ static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
     float p = (float)songPosMs / (float)trackDurMs;
     if (p < 0.0f) p = 0.0f;
     if (p > 1.0f) p = 1.0f;
-    const int filled = (int)(barW * p + 0.5f);
+    const int      filled  = (int)(barW * p + 0.5f);
     const uint16_t bgColor = 0x3186;
     for (int row = barY; row <= barY + 1; row++) {
         for (int x = 0; x < (int)barW; x++) {
-            matrix->drawPixel(barX + x, row,
-                              x < filled ? barColor : bgColor);
+            matrix->drawPixel(barX + x, row, x < filled ? barColor : bgColor);
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// parseHeader — v1.9  (68-byte header, reserved bytes [63-67] now used)
+// parseHeader — v2.0  (80-byte header — clock v1.6 extension at [68..79])
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void parseHeader() {
@@ -279,11 +298,19 @@ static void parseHeader() {
     pktPomodoroOffsetX = (int8_t)h[59];
     pktPomodoroOffsetY = (int8_t)h[60];
     pktPomodoroColor   = ((uint16_t)h[61] << 8) | h[62];
-    // v1.9 — previously reserved bytes
     pktPomodoroLayout    = h[63];
     pktPomodoroSessTotal = h[64];
     pktPomodoroTotalSec  = ((uint16_t)h[65] << 8) | h[66];
     // h[67] reserved
+
+    // ── Clock v1.6 extension [68..79] ────────────────────────────────────
+    pktClockLayoutStyle = h[68];
+    pktClockAnalogFlags = h[69];
+    pktClockTz2Min      = (int16_t)(((uint16_t)h[70] << 8) | h[71]);
+    for (int i = 0; i < 4; i++) pktClockLabel1[i] = (char)h[72 + i];
+    pktClockLabel1[4] = '\0';
+    for (int i = 0; i < 4; i++) pktClockLabel2[i] = (char)h[76 + i];
+    pktClockLabel2[4] = '\0';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +366,8 @@ static void processPacket() {
     activeBarY          = pktBarY;
     activeBarW          = pktBarW;
     activeBarColor      = pktBarColor;
-    // Clock
+
+    // Clock (v1.5)
     activeClockFlags    = pktClockFlags;
     activeClockEpochSec = pktClockEpochSec;
     activeClockTzMin    = pktClockTzMin;
@@ -352,6 +380,16 @@ static void processPacket() {
     activeColonColor    = pktColonColor;
     activeDateColor     = pktDateColor;
     activeAmpmColor     = pktAmpmColor;
+
+    // Clock (v1.6 extension)
+    activeClockLayoutStyle = pktClockLayoutStyle;
+    activeClockAnalogFlags = pktClockAnalogFlags;
+    activeClockTz2Min      = pktClockTz2Min;
+    for (int i = 0; i < 5; i++) {
+        activeClockLabel1[i] = pktClockLabel1[i];
+        activeClockLabel2[i] = pktClockLabel2[i];
+    }
+
     // Pomodoro (v1.8)
     activePomodoroFlags   = pktPomodoroFlags;
     activePomodoroRemSec  = pktPomodoroRemSec;
@@ -360,19 +398,22 @@ static void processPacket() {
     activePomodoroOffsetX = pktPomodoroOffsetX;
     activePomodoroOffsetY = pktPomodoroOffsetY;
     activePomodoroColor   = pktPomodoroColor;
+
     // Pomodoro (v1.9)
     activePomodoroLayout    = pktPomodoroLayout;
     activePomodoroSessTotal = pktPomodoroSessTotal;
     activePomodoroTotalSec  = pktPomodoroTotalSec;
+
     xSemaphoreGive(swapMutex);
 
     pendingBuf = 1 - pendingBuf;
 
-    Serial.printf("[ACK] %d frames @ %d ms/frame  clock=%s font=%d  "
+    Serial.printf("[ACK] %d frames @ %d ms/frame  clock=%s font=%d layout=%d  "
                   "pomo=%s layout=%d remSec=%lu totalSec=%u\n",
                   pktFrameCount, pktDurMs,
                   (pktClockFlags    & CLK_FLAG_PRESENT)  ? "yes" : "no",
                   pktClockFontId,
+                  pktClockLayoutStyle,
                   (pktPomodoroFlags & POMO_FLAG_PRESENT) ? "yes" : "no",
                   pktPomodoroLayout,
                   (unsigned long)pktPomodoroRemSec,
@@ -484,7 +525,7 @@ static void displayTask(void* /*param*/) {
         const uint8_t  barY      = activeBarY;
         const uint8_t  barW      = activeBarW;
         const uint16_t barColor  = activeBarColor;
-        // Clock
+        // Clock (v1.5)
         const uint8_t  clockFlags = activeClockFlags;
         const uint32_t epochSec   = activeClockEpochSec;
         const int16_t  tzMin      = activeClockTzMin;
@@ -497,6 +538,15 @@ static void displayTask(void* /*param*/) {
         const uint16_t colonCol   = activeColonColor;
         const uint16_t dateCol    = activeDateColor;
         const uint16_t ampmCol    = activeAmpmColor;
+        // Clock (v1.6)
+        const uint8_t  clockLayout = activeClockLayoutStyle;
+        const uint8_t  analogFlags = activeClockAnalogFlags;
+        const int16_t  tzMin2      = activeClockTz2Min;
+        char           clockLbl1[5], clockLbl2[5];
+        for (int i = 0; i < 5; i++) {
+            clockLbl1[i] = activeClockLabel1[i];
+            clockLbl2[i] = activeClockLabel2[i];
+        }
         // Pomodoro (v1.8 + v1.9)
         const uint8_t  pomoFlags     = activePomodoroFlags;
         const uint32_t pomoRemSec    = activePomodoroRemSec;
@@ -527,16 +577,20 @@ static void displayTask(void* /*param*/) {
         renderFrame(buf, currentFrame);
 
         // 2. Spotify progress bar (live position from millis())
-        const uint32_t wallMs   = millis() - committed;
+        const uint32_t wallMs    = millis() - committed;
         const uint32_t songPosMs = startPos + wallMs;
         overdrawProgressBar(songPosMs, trackDur, barX, barY, barW, barColor);
 
         // 3. Clock (live wall time from millis() + epoch)
         if (clockFlags & CLK_FLAG_PRESENT) {
-            overdrawClock(epochSec, wallMs, tzMin, clockFlags,
-                          clockFont, clockOffX, clockOffY,
-                          hoursCol, minutesCol, secondsCol,
-                          colonCol, dateCol, ampmCol);
+            overdrawClock(
+                epochSec, wallMs,
+                tzMin,  tzMin2,
+                clockFlags, clockLayout, analogFlags, clockFont,
+                clockOffX, clockOffY,
+                hoursCol, minutesCol, secondsCol,
+                colonCol, dateCol, ampmCol,
+                clockLbl1, clockLbl2);
         }
 
         // 4. Pomodoro countdown (live remaining time from millis()) — v1.9
@@ -630,12 +684,12 @@ void setup() {
 
     Serial.println("Ready.");
     Serial.println("────────────────────────────────────────");
-    Serial.printf("  Protocol:    v1.9 (header %d B)\n", HEADER_SIZE);
+    Serial.printf("  Protocol:    v2.0 (header %d B, clock v1.6)\n", HEADER_SIZE);
     Serial.printf("  Panel:       %dx%d\n", PANEL_WIDTH, REAL_HEIGHT);
     Serial.printf("  Max frames:  %d  (%lu KB max payload)\n",
                   MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
-    Serial.printf("  Clock fonts: 7 (Polymorph…Phantasm) via clockhelper.cpp\n");
-    Serial.printf("  Pomodoro:    split + minimalist layouts via pomodorohelper.cpp\n");
+    Serial.printf("  Clock:       6 styles × 7 fonts via clockhelper + fonthelper\n");
+    Serial.printf("  Pomodoro:    split + minimalist layouts via pomodorohelper\n");
     Serial.printf("  Encoders:    2x KY-040 (ENC1=brightness, ENC2=menu)\n");
     Serial.printf("  Joystick:    KY-023 (5-way + SW)\n");
     Serial.printf("  Buttons:     5x SMD tactile (BTN1-BTN5)\n");
@@ -648,10 +702,8 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
-    // Serial receive (existing)
     processSerial();
 
-    // Drain input event queue and apply actions
     InputEventType evt;
     while (xQueueReceive(inputQueue, &evt, 0) == pdTRUE) {
         inputApplyEvent(evt, matrix);
