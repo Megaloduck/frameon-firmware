@@ -90,23 +90,23 @@
 //   The RESET button connects to the dedicated EN pin (not a GPIO).
 //   Typical circuit: EN → 10kΩ pull-up to 3.3V, 100nF to GND, RESET switch to GND.
 
-// ─── Panel geometry ──────────────────────────────────────────────────────────
+/ ─── Panel geometry ──────────────────────────────────────────────────────────
 #define PANEL_CHAIN         1
 #define DEFAULT_BRIGHTNESS  128
 #define PANEL_WIDTH        64
 #define PANEL_HEIGHT       64
 #define REAL_HEIGHT        32
-
+ 
 // ─── Packet framing ──────────────────────────────────────────────────────────
 #define FRM_MAGIC_0    0x46   // 'F'
 #define FRM_MAGIC_1    0x52   // 'R'
 #define FRM_MAGIC_2    0x4D   // 'M'
-#define FRM_VERSION    0x02   // normal commit
+#define FRM_VERSION    0x03   // v2.0 — 80-byte header with clock v1.6 extension
 #define FRM_NEXT       0x4E   // 'N' — queue as next-song preload
-
-#define HEADER_SIZE    68     // v1.8: expanded for pomodoro overdraw fields
+ 
+#define HEADER_SIZE    80     // v2.0: bumped from 68 for clock v1.6 extension
 #define CRC_SIZE        2
-
+ 
 // ─── Clock flag bits (clockFlags byte, offset 29) ────────────────────────────
 #define CLK_FLAG_PRESENT    0x01  // clock layer is active
 #define CLK_FLAG_H12        0x02  // 12-hour format (else 24-hour)
@@ -114,22 +114,41 @@
 #define CLK_FLAG_DATE       0x08  // show date below time
 #define CLK_FLAG_BLINK      0x10  // blink colon every 500 ms
 #define CLK_FLAG_AMPM       0x20  // show AM/PM (only meaningful with CLK_FLAG_H12)
-
+ 
+// ─── Clock layout styles (v1.6, byte [68]) ──────────────────────────────────
+// Must match Dart ClockLayoutStyle enum order.
+#define CLK_LAYOUT_CLASSIC         0
+#define CLK_LAYOUT_ANALOG          1
+#define CLK_LAYOUT_WEEKDAY_PREFIX  2
+#define CLK_LAYOUT_STACKED         3
+#define CLK_LAYOUT_SECONDS_BAR     4
+#define CLK_LAYOUT_DUAL_TIMEZONE   5
+ 
+// ─── Analog flag bits (analogFlags byte, offset 69) ─────────────────────────
+#define ANALOG_FACE_MASK         0x03  // bits 0-1: AnalogFaceStyle
+#define ANALOG_FACE_CARDINAL     0x00  //   4 dots at 12/3/6/9
+#define ANALOG_FACE_ALL_DOTS     0x01  //   12 dots, one per hour
+#define ANALOG_FACE_TICKS        0x02  //   4 tick lines at 12/3/6/9
+#define ANALOG_FACE_NONE         0x03  //   bare rim
+#define ANALOG_SHOW_SECOND_HAND  0x04  // bit 2
+#define ANALOG_SHOW_DIGITAL      0x08  // bit 3
+ 
 // ─── Pomodoro flag bits (pomodoroFlags byte, offset 52) ──────────────────────
 #define POMO_FLAG_PRESENT    0x01  // pomodoro layer is active
 #define POMO_FLAG_RUNNING    0x02  // timer was running at commit
 #define POMO_FLAG_SECONDS    0x04  // show seconds
 #define POMO_FLAG_SESSION    0x08  // show session dots
 #define POMO_FLAG_BLINK      0x10  // blink colon every 500 ms
-
+ 
 // ─── Serial responses ────────────────────────────────────────────────────────
 #define RESP_ACK       0x06
 #define RESP_NAK       0x15
 #define RESP_ERR       0x1B
-
+ 
 // ─── Buffer limits ───────────────────────────────────────────────────────────
 #define MAX_FRAMES     300
 #define FRAME_PIXELS   (PANEL_WIDTH * REAL_HEIGHT)
 #define FRAME_BYTES    (FRAME_PIXELS * 2)
 #define MAX_PAYLOAD    ((uint32_t)MAX_FRAMES * FRAME_BYTES)
 #define MAX_PACKET     (HEADER_SIZE + MAX_PAYLOAD + CRC_SIZE)
+ 

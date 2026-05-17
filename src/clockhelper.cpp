@@ -1,245 +1,25 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// clockhelper.cpp — Live clock overdraw renderer (v1.7)
+// clockhelper.cpp — Live clock renderer (v1.6)
 //
-// Single source of truth for all font tables and overdrawClock().
-// main.cpp now delegates here via #include "clockhelper.h".
+// Manages wall-time derivation and dispatches to the six per-layout renderers.
+// All glyph data and drawing helpers live in fonthelper.cpp / fonthelper.h.
 //
-// All glyph data copied exactly from lib/engine/renderer/fonts/*.dart
-// so the LED panel always matches the app preview pixel-for-pixel.
-//
-// Font table (indexed by fontId, matches Dart LedFontId enum order):
-//   0 = Polymorph   1 = Brickwork   2 = Waterfox
-//   3 = Vandalism   4 = Destroked   5 = Stereotype   6 = Phantasm
+// Called exclusively from Core 0 (displayTask). Never call from Core 1.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "clockhelper.h"
+#include "fonthelper.h"
 #include "frameon.h"
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <math.h>
 #include <stdio.h>
 
 extern MatrixPanel_I2S_DMA* matrix;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Glyph format
-//   w        — pixel width
-//   rows[7]  — bitmasks, rows[0]=top row, MSB=leftmost pixel
-//
-// Index mapping (same for every font):
-//   0-9 → '0'-'9'   10 → ':'   11 → '.'
-//   12  → 'A'       13 → 'M'   14 → 'P'   15 → ' '
-// ─────────────────────────────────────────────────────────────────────────────
 
-struct Glyph { uint8_t w; uint8_t rows[7]; };
-
-// ── 0: Polymorph ─────────────────────────────────────────────────────────────
-// Source: lib/engine/renderer/fonts/polymorph_font.dart
-static const Glyph kFontPolymorph[16] = {
-    {5, {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}}, // 0
-    {5, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}}, // 1
-    {5, {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}}, // 2
-    {5, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}}, // 3
-    {5, {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}}, // 4
-    {5, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}}, // 5
-    {5, {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}}, // 7
-    {5, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, // 8
-    {5, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}}, // 9
-    {2, {0x00,0x03,0x03,0x00,0x03,0x03,0x00}}, // :
-    {2, {0x00,0x00,0x00,0x00,0x00,0x03,0x03}}, // .
-    {5, {0x04,0x0A,0x11,0x11,0x1F,0x11,0x11}}, // A
-    {5, {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}}, // M
-    {5, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}}, // P
-    {3, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 1: Brickwork ─────────────────────────────────────────────────────────────
-// Source: lib/engine/renderer/fonts/brickwork_font.dart
-static const Glyph kFontBrickwork[16] = {
-    {5, {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}}, // 0
-    {5, {0x04,0x0C,0x04,0x04,0x04,0x04,0x1F}}, // 1
-    {5, {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}}, // 2
-    {5, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}}, // 3
-    {5, {0x03,0x05,0x09,0x11,0x1F,0x01,0x01}}, // 4
-    {5, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}}, // 5
-    {5, {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x11,0x01,0x02,0x04,0x04,0x04}}, // 7
-    {5, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, // 8
-    {5, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}}, // 9
-    {1, {0x00,0x01,0x01,0x00,0x00,0x01,0x01}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x01,0x01}}, // .
-    {5, {0x0E,0x11,0x1F,0x11,0x11,0x11,0x11}}, // A
-    {5, {0x11,0x1B,0x15,0x11,0x11,0x11,0x11}}, // M
-    {5, {0x1E,0x11,0x1E,0x10,0x10,0x10,0x10}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 2: Waterfox ──────────────────────────────────────────────────────────────
-// Source: lib/engine/renderer/fonts/waterfox_font.dart
-// '0' and '8' are 6px wide; 'A' is 7px; 'M' is 9px (stored as 8 low bits)
-static const Glyph kFontWaterfox[16] = {
-    {6, {0x0C,0x12,0x21,0x21,0x21,0x12,0x0C}}, // 0  (w=6)
-    {3, {0x02,0x06,0x02,0x02,0x02,0x02,0x07}}, // 1
-    {5, {0x0E,0x11,0x01,0x02,0x04,0x09,0x1F}}, // 2
-    {5, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}}, // 3
-    {5, {0x02,0x06,0x0A,0x12,0x1F,0x02,0x07}}, // 4
-    {5, {0x1F,0x10,0x16,0x19,0x01,0x11,0x0E}}, // 5
-    {5, {0x0E,0x10,0x16,0x19,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x11,0x02,0x02,0x04,0x04,0x04}}, // 7
-    {6, {0x0C,0x12,0x12,0x1E,0x21,0x21,0x1E}}, // 8  (w=6)
-    {5, {0x0E,0x11,0x11,0x13,0x0D,0x01,0x0E}}, // 9
-    {1, {0x00,0x00,0x01,0x00,0x00,0x00,0x01}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {7, {0x08,0x14,0x14,0x14,0x3E,0x22,0x77}}, // A  (w=7)
-    {8, {0x83,0xC6,0xC6,0xAA,0xAA,0x92,0xD7}}, // M  (w=9 → low 8 bits)
-    {6, {0x3E,0x11,0x11,0x1E,0x10,0x10,0x38}}, // P  (w=6)
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 3: Vandalism ─────────────────────────────────────────────────────────────
-// Source: lib/engine/renderer/fonts/vandalism_font.dart
-static const Glyph kFontVandalism[16] = {
-    {5, {0x0E,0x19,0x1B,0x1D,0x1D,0x19,0x0E}}, // 0
-    {3, {0x02,0x06,0x06,0x02,0x02,0x02,0x07}}, // 1
-    {5, {0x0E,0x19,0x19,0x02,0x04,0x0C,0x1F}}, // 2
-    {5, {0x0E,0x19,0x01,0x06,0x01,0x19,0x0E}}, // 3
-    {5, {0x06,0x0E,0x0A,0x1A,0x1F,0x02,0x07}}, // 4
-    {5, {0x0F,0x18,0x18,0x1E,0x01,0x19,0x0E}}, // 5
-    {5, {0x0E,0x19,0x18,0x1E,0x19,0x19,0x0E}}, // 6
-    {5, {0x0E,0x19,0x19,0x02,0x04,0x04,0x04}}, // 7
-    {5, {0x0E,0x19,0x19,0x0E,0x19,0x19,0x0E}}, // 8
-    {5, {0x0E,0x19,0x19,0x0F,0x01,0x11,0x0E}}, // 9
-    {1, {0x00,0x00,0x01,0x00,0x00,0x01,0x00}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {5, {0x06,0x0E,0x0E,0x1F,0x19,0x19,0x19}}, // A
-    {5, {0x19,0x1B,0x1F,0x1D,0x1D,0x19,0x19}}, // M
-    {5, {0x1E,0x0D,0x0D,0x0E,0x0C,0x0C,0x1E}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 4: Destroked ─────────────────────────────────────────────────────────────
-// Source: lib/engine/renderer/fonts/destroked_font.dart
-static const Glyph kFontDestroked[16] = {
-    {5, {0x0E,0x1B,0x11,0x15,0x11,0x1B,0x0E}}, // 0
-    {3, {0x02,0x04,0x02,0x02,0x02,0x02,0x02}}, // 1
-    {5, {0x16,0x09,0x01,0x0E,0x10,0x12,0x1D}}, // 2
-    {5, {0x0F,0x12,0x02,0x04,0x02,0x11,0x0E}}, // 3
-    {5, {0x19,0x12,0x11,0x1D,0x03,0x01,0x01}}, // 4
-    {5, {0x1F,0x08,0x10,0x1F,0x01,0x0A,0x14}}, // 5
-    {5, {0x0E,0x1B,0x10,0x1E,0x11,0x1B,0x0E}}, // 6
-    {5, {0x0F,0x12,0x04,0x08,0x04,0x04,0x04}}, // 7
-    {5, {0x0F,0x12,0x11,0x0E,0x11,0x09,0x16}}, // 8
-    {5, {0x0D,0x12,0x11,0x0F,0x01,0x09,0x16}}, // 9
-    {1, {0x00,0x02,0x00,0x00,0x00,0x02,0x00}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {5, {0x16,0x09,0x09,0x0F,0x09,0x09,0x09}}, // A
-    {7, {0x61,0x5A,0x52,0x4A,0x4A,0x4A,0x49}}, // M  (w=7)
-    {5, {0x1E,0x09,0x09,0x0E,0x08,0x08,0x08}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 5: Stereotype ────────────────────────────────────────────────────────────
-// Source: lib/engine/renderer/fonts/stereotype_font.dart
-static const Glyph kFontStereotype[16] = {
-    {4, {0x06,0x09,0x0B,0x0D,0x09,0x09,0x06}}, // 0
-    {3, {0x01,0x03,0x05,0x01,0x01,0x01,0x01}}, // 1
-    {4, {0x06,0x09,0x01,0x02,0x04,0x08,0x0F}}, // 2
-    {4, {0x06,0x09,0x01,0x07,0x01,0x09,0x06}}, // 3
-    {4, {0x01,0x03,0x05,0x09,0x0F,0x01,0x01}}, // 4
-    {4, {0x0F,0x08,0x08,0x0E,0x01,0x09,0x06}}, // 5
-    {4, {0x06,0x09,0x08,0x0E,0x09,0x09,0x06}}, // 6
-    {4, {0x0F,0x01,0x02,0x04,0x08,0x08,0x08}}, // 7
-    {4, {0x06,0x09,0x09,0x06,0x09,0x09,0x06}}, // 8
-    {4, {0x06,0x09,0x09,0x07,0x01,0x09,0x06}}, // 9
-    {2, {0x00,0x03,0x00,0x00,0x00,0x00,0x03}}, // :
-    {2, {0x00,0x00,0x00,0x00,0x02,0x02,0x04}}, // .
-    {4, {0x06,0x09,0x09,0x09,0x0F,0x09,0x09}}, // A
-    {7, {0x41,0x63,0x55,0x49,0x41,0x41,0x41}}, // M  (w=7)
-    {4, {0x0E,0x09,0x09,0x0E,0x08,0x08,0x08}}, // P
-    {2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// ── 6: Phantasm ──────────────────────────────────────────────────────────────
-// Source: lib/engine/renderer/fonts/phantasm_font.dart
-static const Glyph kFontPhantasm[16] = {
-    {5, {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}}, // 0
-    {3, {0x02,0x06,0x02,0x02,0x02,0x02,0x07}}, // 1
-    {5, {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}}, // 2
-    {5, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}}, // 3
-    {5, {0x02,0x12,0x12,0x12,0x1F,0x02,0x02}}, // 4
-    {5, {0x1F,0x10,0x10,0x1F,0x01,0x11,0x0E}}, // 5
-    {5, {0x0E,0x11,0x10,0x1E,0x11,0x11,0x0E}}, // 6
-    {5, {0x1F,0x01,0x01,0x02,0x04,0x04,0x04}}, // 7
-    {5, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, // 8
-    {5, {0x0E,0x11,0x11,0x0F,0x01,0x11,0x0E}}, // 9
-    {1, {0x00,0x00,0x01,0x00,0x00,0x01,0x00}}, // :
-    {1, {0x00,0x00,0x00,0x00,0x00,0x00,0x01}}, // .
-    {5, {0x04,0x0A,0x11,0x11,0x1F,0x11,0x11}}, // A
-    {7, {0x41,0x63,0x55,0x49,0x41,0x41,0x41}}, // M  (w=7)
-    {5, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}}, // P
-    {3, {0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, // ' '
-};
-
-// Font table — indexed by fontId (0=Polymorph … 6=Phantasm)
-static const Glyph* const kFonts[7] = {
-    kFontPolymorph,
-    kFontBrickwork,
-    kFontWaterfox,
-    kFontVandalism,
-    kFontDestroked,
-    kFontStereotype,
-    kFontPhantasm,
-};
-
-// Active font pointer — set at the top of overdrawClock()
-static const Glyph* gActiveFont = kFontPolymorph;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Font helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-static int glyphIndex(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c == ':') return 10;
-    if (c == '.') return 11;
-    if (c == 'A') return 12;
-    if (c == 'M') return 13;
-    if (c == 'P') return 14;
-    return 15;
-}
-
-static int glyphWidth(char c) {
-    return gActiveFont[glyphIndex(c)].w + 1; // +1 inter-character gap
-}
-
-static int textWidth(const char* s) {
-    int w = 0;
-    while (*s) { w += glyphWidth(*s++); }
-    return w > 0 ? w - 1 : 0; // no trailing gap
-}
-
-static void drawGlyph(char c, int x, int y, uint16_t color) {
-    const Glyph& g = gActiveFont[glyphIndex(c)];
-    for (int row = 0; row < 7; row++) {
-        const uint8_t bits = g.rows[row];
-        for (int col = 0; col < (int)g.w; col++) {
-            if ((bits >> (g.w - 1 - col)) & 1) {
-                matrix->drawPixel(x + col, y + row, color);
-            }
-        }
-    }
-}
-
-static void drawText(const char* s, int x, int y, uint16_t color) {
-    while (*s) {
-        drawGlyph(*s, x, y, color);
-        x += glyphWidth(*s);
-        s++;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Gregorian calendar decomposition
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// TIME DECOMPOSITION
+// ═════════════════════════════════════════════════════════════════════════════
 
 struct ClockTime { int hour, minute, second, day, month, year; };
 
@@ -281,107 +61,366 @@ static ClockTime epochToTime(uint32_t epochSec, int16_t tzOffsetMin) {
     return ct;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// overdrawClock — v1.7
-// ─────────────────────────────────────────────────────────────────────────────
+// Zeller's congruence — returns 0=MON .. 6=SUN.
+static int dayOfWeek(int year, int month, int day) {
+    int y = year, m = month;
+    if (m < 3) { m += 12; y -= 1; }
+    int K = y % 100, J = y / 100;
+    int h = (day + (13 * (m + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+    static const int remap[7] = {5, 6, 0, 1, 2, 3, 4};
+    return remap[h];
+}
+
+static const char* kWeekdayShort[7] = {
+    "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"
+};
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PER-STYLE RENDERERS — forward declarations
+// ═════════════════════════════════════════════════════════════════════════════
+
+static void clockClassic(const ClockTime& ct, uint32_t wallMs, uint8_t flags,
+    int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t sCol,
+    uint16_t cCol, uint16_t dCol, uint16_t aCol);
+
+static void clockAnalog(const ClockTime& ct, uint8_t analogFlags,
+    int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t sCol,
+    uint16_t cCol, uint16_t faceCol,
+    bool h12, bool blink, uint32_t wallMs);
+
+static void clockWeekdayPrefix(const ClockTime& ct, uint32_t wallMs,
+    bool h12, bool blink, int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t cCol, uint16_t lblCol);
+
+static void clockStacked(const ClockTime& ct, bool h12,
+    int8_t offX, int8_t offY, uint16_t hCol, uint16_t mCol);
+
+static void clockSecondsBar(const ClockTime& ct, uint32_t wallMs,
+    bool h12, bool blink, int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t cCol, uint16_t barCol);
+
+static void clockDualTz(const ClockTime& ct1, const ClockTime& ct2,
+    const char* lbl1, const char* lbl2, uint32_t wallMs,
+    bool h12, bool blink, int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t cCol, uint16_t lblCol);
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═════════════════════════════════════════════════════════════════════════════
 
 void overdrawClock(
-    uint32_t epochSec,
-    uint32_t wallMs,
-    int16_t  tzOffsetMin,
-    uint8_t  flags,
-    uint8_t  fontId,
-    int8_t   offX,
-    int8_t   offY,
-    uint16_t hoursCol,
-    uint16_t minutesCol,
-    uint16_t secondsCol,
-    uint16_t colonCol,
-    uint16_t dateCol,
-    uint16_t ampmCol)
+    uint32_t    epochSec,
+    uint32_t    wallMs,
+    int16_t     tzOffsetMin,
+    int16_t     tz2OffsetMin,
+    uint8_t     flags,
+    uint8_t     layoutStyle,
+    uint8_t     analogFlags,
+    uint8_t     fontId,
+    int8_t      offX,
+    int8_t      offY,
+    uint16_t    hoursCol,
+    uint16_t    minutesCol,
+    uint16_t    secondsCol,
+    uint16_t    colonCol,
+    uint16_t    dateCol,
+    uint16_t    ampmCol,
+    const char* label1,
+    const char* label2)
 {
     if (!(flags & CLK_FLAG_PRESENT)) return;
 
-    // Select font — clamp to valid range
-    gActiveFont = kFonts[fontId < 7 ? fontId : 0];
+    fontSetActive(fontId); // sets gActiveFont + gActiveAlphabet
 
+    const uint32_t  wallSec    = epochSec + wallMs / 1000;
+    const ClockTime ct         = epochToTime(wallSec, tzOffsetMin);
+    const bool      h12        = flags & CLK_FLAG_H12;
+    const bool      blinkColon = flags & CLK_FLAG_BLINK;
+
+    switch (layoutStyle) {
+        case CLK_LAYOUT_ANALOG:
+            clockAnalog(ct, analogFlags, offX, offY,
+                hoursCol, minutesCol, secondsCol, colonCol, dateCol,
+                h12, blinkColon, wallMs);
+            break;
+
+        case CLK_LAYOUT_WEEKDAY_PREFIX:
+            clockWeekdayPrefix(ct, wallMs, h12, blinkColon,
+                offX, offY, hoursCol, minutesCol, colonCol, ampmCol);
+            break;
+
+        case CLK_LAYOUT_STACKED:
+            clockStacked(ct, h12, offX, offY, hoursCol, minutesCol);
+            break;
+
+        case CLK_LAYOUT_SECONDS_BAR:
+            clockSecondsBar(ct, wallMs, h12, blinkColon,
+                offX, offY, hoursCol, minutesCol, colonCol, secondsCol);
+            break;
+
+        case CLK_LAYOUT_DUAL_TIMEZONE: {
+            const ClockTime ct2 = epochToTime(wallSec, tz2OffsetMin);
+            clockDualTz(ct, ct2, label1, label2, wallMs, h12, blinkColon,
+                offX, offY, hoursCol, minutesCol, colonCol, ampmCol);
+            break;
+        }
+
+        case CLK_LAYOUT_CLASSIC:
+        default:
+            clockClassic(ct, wallMs, flags, offX, offY,
+                hoursCol, minutesCol, secondsCol, colonCol, dateCol, ampmCol);
+            break;
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PER-STYLE RENDERER IMPLEMENTATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── Classic ───────────────────────────────────────────────────────────────────
+static void clockClassic(const ClockTime& ct, uint32_t wallMs, uint8_t flags,
+    int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t sCol,
+    uint16_t cCol, uint16_t dCol, uint16_t aCol)
+{
     const bool h12      = flags & CLK_FLAG_H12;
     const bool showSec  = flags & CLK_FLAG_SECONDS;
     const bool showDate = flags & CLK_FLAG_DATE;
-    const bool blinkCol = flags & CLK_FLAG_BLINK;
+    const bool doBlink  = flags & CLK_FLAG_BLINK;
     const bool showAmPm = flags & CLK_FLAG_AMPM;
+    const bool colonVis = !doBlink || (wallMs % 1000) < 500;
 
-    const uint32_t wallSec     = epochSec + wallMs / 1000;
-    ClockTime      ct          = epochToTime(wallSec, tzOffsetMin);
-    const bool     colonVisible = !blinkCol || (wallMs % 1000) < 500;
-
-    char hBuf[4], mBuf[4], sBuf[4], ampmBuf[4], dateBuf[10];
-
+    char hBuf[4], mBuf[4], sBuf[4], amBuf[4], dateBuf[10];
     int dispHour = ct.hour;
     if (h12) {
         dispHour = ct.hour % 12;
-        if (dispHour == 0) dispHour = 12;
-        snprintf(hBuf,    sizeof(hBuf),    "%d",  dispHour);
-        snprintf(ampmBuf, sizeof(ampmBuf), "%s",  ct.hour < 12 ? "AM" : "PM");
+        if (!dispHour) dispHour = 12;
+        snprintf(hBuf, sizeof(hBuf), "%d",  dispHour);
+        snprintf(amBuf, sizeof(amBuf), "%s", ct.hour < 12 ? "AM" : "PM");
     } else {
-        snprintf(hBuf,    sizeof(hBuf),    "%02d", dispHour);
-        ampmBuf[0] = '\0';
+        snprintf(hBuf, sizeof(hBuf), "%02d", dispHour);
+        amBuf[0] = '\0';
     }
     snprintf(mBuf,    sizeof(mBuf),    "%02d", ct.minute);
     snprintf(sBuf,    sizeof(sBuf),    "%02d", ct.second);
     snprintf(dateBuf, sizeof(dateBuf), "%02d.%02d.%02d",
              ct.day, ct.month, ct.year % 100);
 
-    // Measure time row width — mirrors ClockWidget spacing exactly:
-    //   spacingBeforeColon=2, spacingAfterColon=0, spacingGeneral=1
-    // Use glyph.w for ':' directly (not glyphWidth which adds +1 inter-char gap),
-    // matching Dart's font.textWidth(':') which also returns bare glyph width.
     const int colonW = gActiveFont[glyphIndex(':')].w;
-    int timeW = textWidth(hBuf)
-              + 2 + colonW            // spacingBeforeColon=2, colon glyph width
-              + textWidth(mBuf);
+    int timeW = textWidth(hBuf) + 2 + colonW + textWidth(mBuf);
     if (showSec)  timeW += 2 + colonW + textWidth(sBuf);
-    if (showAmPm) timeW += 1 + textWidth(ampmBuf);
+    if (showAmPm) timeW += 1 + textWidth(amBuf);
 
-    // Vertical layout
     const int charH  = 7;
     const int totalH = charH + (showDate ? charH + 2 : 0);
-    const int startY = (REAL_HEIGHT - totalH) / 2 + (int)offY;
-    const int timeY  = startY;
-    const int dateY  = startY + charH + 2;
+    const int startY = (REAL_HEIGHT - totalH) / 2 + offY;
+    int cx = (PANEL_WIDTH - timeW) / 2 + offX;
 
-    // Draw time row (centered + offset)
-    int cx = (PANEL_WIDTH - timeW) / 2 + (int)offX;
-
-    drawText(hBuf, cx, timeY, hoursCol);
-    cx += textWidth(hBuf);
-
-    cx += 2; // spacingBeforeColon
-    if (colonVisible) drawGlyph(':', cx - 1, timeY, colonCol); // colonVisualOffset = -1
-    cx += glyphWidth(':') - 1;
-
-    drawText(mBuf, cx, timeY, minutesCol);
-    cx += textWidth(mBuf);
+    drawText(hBuf, cx, startY, hCol);               cx += textWidth(hBuf) + 2;
+    if (colonVis) drawGlyph(':', cx - 1, startY, cCol);
+    cx += colonW - 1;
+    drawText(mBuf, cx, startY, mCol);               cx += textWidth(mBuf);
 
     if (showSec) {
         cx += 2;
-        if (colonVisible) drawGlyph(':', cx - 1, timeY, colonCol);
-        cx += glyphWidth(':') - 1;
-        drawText(sBuf, cx, timeY, secondsCol);
-        cx += textWidth(sBuf);
+        if (colonVis) drawGlyph(':', cx - 1, startY, cCol);
+        cx += colonW - 1;
+        drawText(sBuf, cx, startY, sCol);           cx += textWidth(sBuf);
     }
-
-    if (showAmPm && ampmBuf[0]) {
+    if (showAmPm && amBuf[0]) {
         cx += 1;
-        drawText(ampmBuf, cx, timeY, ampmCol);
+        drawText(amBuf, cx, startY, aCol);
     }
-
-    // Date row (centered below time)
     if (showDate) {
         const int dw = textWidth(dateBuf);
-        const int dx = (PANEL_WIDTH - dw) / 2 + (int)offX;
-        drawText(dateBuf, dx, dateY, dateCol);
+        drawText(dateBuf, (PANEL_WIDTH - dw) / 2 + offX, startY + charH + 2, dCol);
+    }
+}
+
+// ── Analog ────────────────────────────────────────────────────────────────────
+static void clockAnalog(const ClockTime& ct, uint8_t analogFlags,
+    int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t sCol,
+    uint16_t cCol, uint16_t faceCol,
+    bool h12, bool blink, uint32_t wallMs)
+{
+    const uint8_t faceStyle   = analogFlags & ANALOG_FACE_MASK;
+    const bool    showSecHand = analogFlags & ANALOG_SHOW_SECOND_HAND;
+    const bool    showDigital = analogFlags & ANALOG_SHOW_DIGITAL;
+
+    const int radius = 14;
+    const int faceCx = (showDigital ? 15 : (PANEL_WIDTH / 2 - 1)) + offX;
+    const int faceCy = (REAL_HEIGHT / 2 - 1) + offY;
+
+    matrix->drawCircle(faceCx, faceCy, radius, faceCol);
+
+    auto dotAt = [&](int hour) {
+        const float r = hour * 30.0f * (float)M_PI / 180.0f;
+        matrix->drawPixel(
+            faceCx + (int)((radius-2) * sinf(r) + 0.5f),
+            faceCy - (int)((radius-2) * cosf(r) + 0.5f), faceCol);
+    };
+    auto tickAt = [&](int hour) {
+        const float r = hour * 30.0f * (float)M_PI / 180.0f;
+        matrix->drawLine(
+            faceCx + (int)(radius     * sinf(r) + 0.5f),
+            faceCy - (int)(radius     * cosf(r) + 0.5f),
+            faceCx + (int)((radius-2) * sinf(r) + 0.5f),
+            faceCy - (int)((radius-2) * cosf(r) + 0.5f), faceCol);
+    };
+    switch (faceStyle) {
+        case ANALOG_FACE_CARDINAL:
+            for (int h : {0,3,6,9}) dotAt(h);  break;
+        case ANALOG_FACE_ALL_DOTS:
+            for (int h = 0; h < 12; h++) dotAt(h);  break;
+        case ANALOG_FACE_TICKS:
+            for (int h : {0,3,6,9}) tickAt(h);  break;
+        default: break;
     }
 
-    // NOTE: flipDMABuffer() is called by displayTask after this returns.
+    const float minFrac = ct.minute / 60.0f;
+    const float secFrac = ct.second / 60.0f;
+    auto handTo = [&](float deg, int len, uint16_t col) {
+        const float r = deg * (float)M_PI / 180.0f;
+        matrix->drawLine(faceCx, faceCy,
+            faceCx + (int)(len * sinf(r) + 0.5f),
+            faceCy - (int)(len * cosf(r) + 0.5f), col);
+    };
+    handTo(((ct.hour % 12) + minFrac) * 30.0f, radius - 7, hCol);
+    handTo((ct.minute + secFrac) * 6.0f,        radius - 2, mCol);
+    if (showSecHand) handTo(ct.second * 6.0f,   radius - 1, sCol);
+    matrix->drawPixel(faceCx, faceCy, hCol);
+
+    if (showDigital) {
+        const bool cv = !blink || (wallMs % 1000) < 500;
+        char hBuf[4], mBuf[4];
+        int dh = ct.hour;
+        if (h12) { dh = dh % 12; if (!dh) dh = 12; snprintf(hBuf, 4, "%d",  dh); }
+        else                                          snprintf(hBuf, 4, "%02d", dh);
+        snprintf(mBuf, 4, "%02d", ct.minute);
+
+        const int colonW = gActiveFont[glyphIndex(':')].w;
+        const int timeW  = textWidth(hBuf) + 2 + colonW + textWidth(mBuf);
+        const int xStart = 32 + (32 - timeW) / 2 + offX;
+        const int y      = (REAL_HEIGHT - 7) / 2 + offY;
+
+        int cx = xStart;
+        drawText(hBuf, cx, y, hCol);   cx += textWidth(hBuf) + 2;
+        if (cv) drawGlyph(':', cx - 1, y, cCol);
+        cx += colonW - 1;
+        drawText(mBuf, cx, y, mCol);
+    }
+}
+
+// ── Weekday prefix ────────────────────────────────────────────────────────────
+static void clockWeekdayPrefix(const ClockTime& ct, uint32_t wallMs,
+    bool h12, bool blink, int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t cCol, uint16_t lblCol)
+{
+    const bool cv = !blink || (wallMs % 1000) < 500;
+    const char* wd = kWeekdayShort[dayOfWeek(ct.year, ct.month, ct.day)];
+
+    char hBuf[4], mBuf[4];
+    int dh = ct.hour;
+    if (h12) { dh = dh % 12; if (!dh) dh = 12; snprintf(hBuf, 4, "%d",  dh); }
+    else                                          snprintf(hBuf, 4, "%02d", dh);
+    snprintf(mBuf, 4, "%02d", ct.minute);
+
+    const int colonW = gActiveFont[glyphIndex(':')].w;
+    const int wdW    = labelWidth(wd);
+    const int timeW  = textWidth(hBuf) + 2 + colonW + textWidth(mBuf);
+    const int y      = (REAL_HEIGHT - 7) / 2 + offY;
+    int cx           = (PANEL_WIDTH - (wdW + 2 + timeW)) / 2 + offX;
+
+    drawLabel(wd,   cx, y, lblCol); cx += wdW + 2;
+    drawText(hBuf,  cx, y, hCol);   cx += textWidth(hBuf) + 2;
+    if (cv) drawGlyph(':', cx - 1, y, cCol);
+    cx += colonW - 1;
+    drawText(mBuf, cx, y, mCol);
+}
+
+// ── Stacked ───────────────────────────────────────────────────────────────────
+static void clockStacked(const ClockTime& ct, bool h12,
+    int8_t offX, int8_t offY, uint16_t hCol, uint16_t mCol)
+{
+    char hBuf[4], mBuf[4];
+    int dh = ct.hour;
+    if (h12) { dh = dh % 12; if (!dh) dh = 12; snprintf(hBuf, 4, "%d",  dh); }
+    else                                          snprintf(hBuf, 4, "%02d", dh);
+    snprintf(mBuf, 4, "%02d", ct.minute);
+
+    const int totalH = 7 * 2 + 2;
+    const int startY = (REAL_HEIGHT - totalH) / 2 + offY;
+    drawText(hBuf, (PANEL_WIDTH - textWidth(hBuf)) / 2 + offX, startY,     hCol);
+    drawText(mBuf, (PANEL_WIDTH - textWidth(mBuf)) / 2 + offX, startY + 9, mCol);
+}
+
+// ── Seconds bar ───────────────────────────────────────────────────────────────
+static void clockSecondsBar(const ClockTime& ct, uint32_t wallMs,
+    bool h12, bool blink, int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t cCol, uint16_t barCol)
+{
+    const bool cv = !blink || (wallMs % 1000) < 500;
+
+    char hBuf[4], mBuf[4];
+    int dh = ct.hour;
+    if (h12) { dh = dh % 12; if (!dh) dh = 12; snprintf(hBuf, 4, "%d",  dh); }
+    else                                          snprintf(hBuf, 4, "%02d", dh);
+    snprintf(mBuf, 4, "%02d", ct.minute);
+
+    const int colonW = gActiveFont[glyphIndex(':')].w;
+    const int timeW  = textWidth(hBuf) + 2 + colonW + textWidth(mBuf);
+    const int totalH = 7 + 2 + 2;
+    const int startY = (REAL_HEIGHT - totalH) / 2 + offY;
+    const int barY   = startY + 7 + 2;
+    int cx           = (PANEL_WIDTH - timeW) / 2 + offX;
+
+    drawText(hBuf, cx, startY, hCol);   cx += textWidth(hBuf) + 2;
+    if (cv) drawGlyph(':', cx - 1, startY, cCol);
+    cx += colonW - 1;
+    drawText(mBuf, cx, startY, mCol);
+
+    const int barW   = 50;
+    const int barX   = (PANEL_WIDTH - barW) / 2 + offX;
+    matrix->fillRect(barX, barY, barW, 2, (barCol & 0xF7DE) >> 1); // dim track
+    const int filled = (barW * ct.second) / 60;
+    if (filled > 0) matrix->fillRect(barX, barY, filled, 2, barCol);
+}
+
+// ── Dual timezone ─────────────────────────────────────────────────────────────
+static void clockDualTz(const ClockTime& ct1, const ClockTime& ct2,
+    const char* lbl1, const char* lbl2, uint32_t wallMs,
+    bool h12, bool blink, int8_t offX, int8_t offY,
+    uint16_t hCol, uint16_t mCol, uint16_t cCol, uint16_t lblCol)
+{
+    const bool cv    = !blink || (wallMs % 1000) < 500;
+    const int totalH = 7 * 2 + 2;
+    const int startY = (REAL_HEIGHT - totalH) / 2 + offY;
+
+    auto drawRow = [&](const char* label, const ClockTime& ct, int y) {
+        char hBuf[4], mBuf[4];
+        int dh = ct.hour;
+        if (h12) { dh = dh % 12; if (!dh) dh = 12; snprintf(hBuf, 4, "%d",  dh); }
+        else                                          snprintf(hBuf, 4, "%02d", dh);
+        snprintf(mBuf, 4, "%02d", ct.minute);
+
+        const int colonW = gActiveFont[glyphIndex(':')].w;
+        const int lblW   = labelWidth(label);
+        const int timeW  = textWidth(hBuf) + 2 + colonW + textWidth(mBuf);
+        int cx = (PANEL_WIDTH - (lblW + 2 + timeW)) / 2 + offX;
+
+        drawLabel(label, cx, y, lblCol); cx += lblW + 2;
+        drawText(hBuf,   cx, y, hCol);   cx += textWidth(hBuf) + 2;
+        if (cv) drawGlyph(':', cx - 1, y, cCol);
+        cx += colonW - 1;
+        drawText(mBuf, cx, y, mCol);
+    };
+
+    drawRow(lbl1, ct1, startY);
+    drawRow(lbl2, ct2, startY + 9);
 }
