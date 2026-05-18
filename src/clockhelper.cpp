@@ -88,7 +88,7 @@ static void clockClassic(const ClockTime& ct, uint32_t wallMs, uint8_t flags,
 static void clockAnalog(const ClockTime& ct, uint8_t analogFlags,
     int8_t offX, int8_t offY,
     uint16_t hCol, uint16_t mCol, uint16_t sCol,
-    uint16_t cCol, uint16_t faceCol,
+    uint16_t cCol, uint16_t faceCol, uint16_t rimCol,
     bool h12, bool blink, uint32_t wallMs);
 
 static void clockWeekdayPrefix(const ClockTime& ct, uint32_t wallMs,
@@ -144,7 +144,7 @@ void overdrawClock(
     switch (layoutStyle) {
         case CLK_LAYOUT_ANALOG:
             clockAnalog(ct, analogFlags, offX, offY,
-                hoursCol, minutesCol, secondsCol, colonCol, dateCol,
+                hoursCol, minutesCol, secondsCol, colonCol, dateCol, ampmCol,
                 h12, blinkColon, wallMs);
             break;
 
@@ -246,32 +246,64 @@ static void clockClassic(const ClockTime& ct, uint32_t wallMs, uint8_t flags,
 static void clockAnalog(const ClockTime& ct, uint8_t analogFlags,
     int8_t offX, int8_t offY,
     uint16_t hCol, uint16_t mCol, uint16_t sCol,
-    uint16_t cCol, uint16_t faceCol,
+    uint16_t cCol, uint16_t faceCol, uint16_t rimCol,
     bool h12, bool blink, uint32_t wallMs)
 {
     const uint8_t faceStyle   = analogFlags & ANALOG_FACE_MASK;
     const bool    showSecHand = analogFlags & ANALOG_SHOW_SECOND_HAND;
     const bool    showDigital = analogFlags & ANALOG_SHOW_DIGITAL;
 
-    const int radius = 14;
-    const int faceCx = (showDigital ? 15 : (PANEL_WIDTH / 2 - 1)) + offX;
-    const int faceCy = (REAL_HEIGHT / 2 - 1) + offY;
+    // Half-pixel centre (cx+0.5, cy+0.5) with radius 13.5 gives exactly
+    // 2 px margin on all four sides of the 32-row panel:
+    //   round(15.5 - 13.5) = 2,  round(15.5 + 13.5) = 29  → 2 px bottom.
+    const float radius = 13.5f;
+    const float faceCx = (float)(showDigital ? 15 : (PANEL_WIDTH / 2 - 1)) + offX + 0.5f;
+    const float faceCy = (float)(REAL_HEIGHT / 2 - 1) + offY + 0.5f;
 
-    matrix->drawCircle(faceCx, faceCy, radius, faceCol);
+    // Parametric circle — float centre/radius, round each pixel position.
+    {
+        const int steps = (int)(2.0f * (float)M_PI * radius * 2.0f) + 8;
+        for (int i = 0; i < steps; i++) {
+            float angle = 2.0f * (float)M_PI * i / steps;
+            int px = (int)(faceCx + radius * sinf(angle) + 0.5f);
+            int py = (int)(faceCy - radius * cosf(angle) + 0.5f);
+            if (px >= 0 && px < PANEL_WIDTH && py >= 0 && py < REAL_HEIGHT)
+                matrix->drawPixel(px, py, rimCol);
+        }
+    }
 
     auto dotAt = [&](int hour) {
-        const float r = hour * 30.0f * (float)M_PI / 180.0f;
-        matrix->drawPixel(
-            faceCx + (int)((radius-2) * sinf(r) + 0.5f),
-            faceCy - (int)((radius-2) * cosf(r) + 0.5f), faceCol);
+        const float r     = hour * 30.0f * (float)M_PI / 180.0f;
+        const float inner = radius - 2.0f;
+        const float fx    = faceCx + inner * sinf(r);
+        const float fy    = faceCy - inner * cosf(r);
+
+        if (hour == 0 || hour == 6) {
+            // 2×1 horizontal — two adjacent X pixels at the same Y
+            const int y = (int)(fy + 0.5f);
+            matrix->drawPixel((int)floorf(fx), y, faceCol);
+            matrix->drawPixel((int)ceilf(fx),  y, faceCol);
+        } else if (hour == 3 || hour == 9) {
+            // 1×2 vertical — two adjacent Y pixels at the same X
+            const int x = (int)(fx + 0.5f);
+            matrix->drawPixel(x, (int)floorf(fy), faceCol);
+            matrix->drawPixel(x, (int)ceilf(fy),  faceCol);
+        } else {
+            // Non-cardinal hours — single pixel
+            matrix->drawPixel((int)(fx + 0.5f), (int)(fy + 0.5f), faceCol);
+        }
     };
     auto tickAt = [&](int hour) {
-        const float r = hour * 30.0f * (float)M_PI / 180.0f;
-        matrix->drawLine(
-            faceCx + (int)(radius     * sinf(r) + 0.5f),
-            faceCy - (int)(radius     * cosf(r) + 0.5f),
-            faceCx + (int)((radius-2) * sinf(r) + 0.5f),
-            faceCy - (int)((radius-2) * cosf(r) + 0.5f), faceCol);
+        // 2x2-pixel tick: 2 px deep from rim, 2 px wide (perpendicular)
+        const float r  = hour * 30.0f * (float)M_PI / 180.0f;
+        const int   dx = (int)(cosf(r) + 0.5f);
+        const int   dy = (int)(sinf(r) + 0.5f);
+        for (int depth = 0; depth <= 1; depth++) {
+            const int x = (int)(faceCx + (radius - depth) * sinf(r) + 0.5f);
+            const int y = (int)(faceCy - (radius - depth) * cosf(r) + 0.5f);
+            matrix->drawPixel(x,      y,      faceCol);
+            matrix->drawPixel(x + dx, y + dy, faceCol);
+        }
     };
     switch (faceStyle) {
         case ANALOG_FACE_CARDINAL:
@@ -286,15 +318,17 @@ static void clockAnalog(const ClockTime& ct, uint8_t analogFlags,
     const float minFrac = ct.minute / 60.0f;
     const float secFrac = ct.second / 60.0f;
     auto handTo = [&](float deg, int len, uint16_t col) {
-        const float r = deg * (float)M_PI / 180.0f;
-        matrix->drawLine(faceCx, faceCy,
-            faceCx + (int)(len * sinf(r) + 0.5f),
-            faceCy - (int)(len * cosf(r) + 0.5f), col);
+        const float r  = deg * (float)M_PI / 180.0f;
+        const int   cx = (int)faceCx;
+        const int   cy = (int)faceCy;
+        matrix->drawLine(cx, cy,
+            (int)(faceCx + len * sinf(r) + 0.5f),
+            (int)(faceCy - len * cosf(r) + 0.5f), col);
     };
     handTo(((ct.hour % 12) + minFrac) * 30.0f, radius - 7, hCol);
     handTo((ct.minute + secFrac) * 6.0f,        radius - 2, mCol);
     if (showSecHand) handTo(ct.second * 6.0f,   radius - 1, sCol);
-    matrix->drawPixel(faceCx, faceCy, hCol);
+    matrix->drawPixel((int)faceCx, (int)faceCy, hCol);
 
     if (showDigital) {
         const bool cv = !blink || (wallMs % 1000) < 500;
@@ -385,16 +419,9 @@ static void clockSecondsBar(const ClockTime& ct, uint32_t wallMs,
     cx += colonW;
     drawText(mBuf, cx, startY, mCol);
 
-    const int barW   = 50; 
-    const int barX   = (PANEL_WIDTH - barW) / 2 + offX;//
-    
-    // Use RGB(64,64,64) - Dark grey for better visibility of colored fill
-    const uint16_t greyTrack = 0x3186; // RGB565 for (64,64,64)
-    
-    // Draw entire bar in dark grey (un-filled background)
-    matrix->fillRect(barX, barY, barW, 2, greyTrack);
-    
-    // Draw colored fill for elapsed seconds
+    const int barW   = 50;
+    const int barX   = (PANEL_WIDTH - barW) / 2 + offX;
+    matrix->fillRect(barX, barY, barW, 2, (barCol & 0xF7DE) >> 1); // dim track
     const int filled = (barW * ct.second) / 60;
     if (filled > 0) matrix->fillRect(barX, barY, filled, 2, barCol);
 }
