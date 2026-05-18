@@ -419,9 +419,16 @@ static void clockSecondsBar(const ClockTime& ct, uint32_t wallMs,
     cx += colonW;
     drawText(mBuf, cx, startY, mCol);
 
-    const int barW   = 50;
-    const int barX   = (PANEL_WIDTH - barW) / 2 + offX;
-    matrix->fillRect(barX, barY, barW, 2, (barCol & 0xF7DE) >> 1); // dim track
+    const int barW   = 50; 
+    const int barX   = (PANEL_WIDTH - barW) / 2 + offX;//
+    
+    // Use RGB(64,64,64) - Dark grey for better visibility of colored fill
+    const uint16_t greyTrack = 0x3186; // RGB565 for (64,64,64)
+    
+    // Draw entire bar in dark grey (un-filled background)
+    matrix->fillRect(barX, barY, barW, 2, greyTrack);
+    
+    // Draw colored fill for elapsed seconds
     const int filled = (barW * ct.second) / 60;
     if (filled > 0) matrix->fillRect(barX, barY, filled, 2, barCol);
 }
