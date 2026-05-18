@@ -260,7 +260,7 @@ void inputInit() {
 }
 
 void inputTaskStart() {
-    xTaskCreatePinnedToCore(inputTask, "inputTask", 4096, nullptr, 2, nullptr, 1);
+    xTaskCreatePinnedToCore(inputTask, "inputTask", 4096, nullptr, 1, nullptr, 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

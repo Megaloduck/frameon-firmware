@@ -33,6 +33,7 @@
 #include "pomodorohelper.h"
 #include "waitingscreen.h"
 #include "inputhelper.h"
+#include "debug_log.h"
 
 MatrixPanel_I2S_DMA* matrix = nullptr;
 
@@ -326,8 +327,8 @@ static void processPacket() {
                               | buf[HEADER_SIZE + pktPayloadBytes + 1];
 
     if (computed != received) {
-        Serial.printf("[NAK] CRC mismatch: computed=0x%04X received=0x%04X\n",
-                      computed, received);
+        DLOGF("[NAK] CRC mismatch: computed=0x%04X received=0x%04X\n",
+              computed, received);
         Serial.write(RESP_NAK);
         Serial.flush();
         return;
@@ -348,7 +349,7 @@ static void processPacket() {
         nextBufReady   = true;
         xSemaphoreGive(nextMutex);
 
-        Serial.printf("[ACK-NEXT] %d frames preloaded\n", pktFrameCount);
+        DLOGF("[ACK-NEXT] %d frames preloaded\n", pktFrameCount);
         Serial.write(RESP_ACK);
         Serial.flush();
         return;
@@ -440,7 +441,7 @@ static void processSerial() {
             rxIdx   = 3;
             rxState = RX_HEADER;
             memset(syncBuf, 0, sizeof(syncBuf));
-            Serial.println("[RX]  Magic found — reading header...");
+            DLOGLN("[RX]  Magic found — reading header...");
         }
     }
 
@@ -462,14 +463,14 @@ static void processSerial() {
                          && (HEADER_SIZE + pktPayloadBytes + CRC_SIZE <= MAX_PACKET)
                          && (pktFlags == FRM_VERSION || pktFlags == FRM_NEXT);
             if (!ok) {
-                Serial.printf("[ERR] Header invalid — w=%d h=%d fc=%d flags=0x%02X\n",
-                              pktWidth, pktHeight, pktFrameCount, pktFlags);
+                DLOGF("[ERR] Header invalid — w=%d h=%d fc=%d flags=0x%02X\n",
+                      pktWidth, pktHeight, pktFrameCount, pktFlags);
                 Serial.write(RESP_ERR); Serial.flush();
                 rxState = RX_IDLE; rxIdx = 0;
             } else {
                 rxState = RX_PAYLOAD;
-                Serial.printf("[RX]  Header OK — %d frames %lu B %d ms/frame\n",
-                              pktFrameCount, (unsigned long)pktPayloadBytes, pktDurMs);
+                DLOGF("[RX]  Header OK — %d frames %lu B %d ms/frame\n",
+                      pktFrameCount, (unsigned long)pktPayloadBytes, pktDurMs);
             }
         }
     }
@@ -478,8 +479,7 @@ static void processSerial() {
         const uint32_t payloadEnd = HEADER_SIZE + pktPayloadBytes;
         const uint32_t needed     = payloadEnd - rxIdx;
         const size_t   avail      = (size_t)Serial.available();
-        const size_t   toRead     = (needed < (uint32_t)avail) ?
-                                    (size_t)needed : (size_t)avail;
+        const size_t   toRead     = (needed < (uint32_t)avail) ? (size_t)needed : (size_t)avail;
         Serial.readBytes((char*)buf + rxIdx, toRead);
         rxIdx += (uint32_t)toRead;
         if (rxIdx == payloadEnd) rxState = RX_CRC_H;
@@ -624,35 +624,45 @@ static void displayTask(void* /*param*/) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
+    // ── CRITICAL: buffer sizing must come BEFORE Serial.begin() ──────────
+    // Default RX buffer is 256 bytes = ~2.8 ms at 921600 baud. Any time
+    // loop() spends in Serial.println/printf or gets preempted by
+    // inputTask for longer than that, the UART RX FIFO overflows silently
+    // (no flow control on the CH340N bridge). 8 KB gives ~89 ms headroom.
+    Serial.setRxBufferSize(8192);
+    Serial.setTxBufferSize(2048);
     Serial.begin(921600);
     delay(200);
-    Serial.println("\n\nFrameon Firmware v3.0");
-    Serial.println("════════════════════════════════════════");
+
+    BOOTLOGLN("\n\nFrameon Firmware v3.1");
+    BOOTLOGLN("════════════════════════════════════════");
+    BOOTLOGF("  RX buffer:   %u B\n", 8192);
+    BOOTLOGF("  TX buffer:   %u B\n", 2048);
 
     for (int i = 0; i < 2; i++) {
         pktBuf[i] = (uint8_t*)ps_malloc(MAX_PACKET);
         if (!pktBuf[i]) {
-            Serial.printf("FATAL: ps_malloc failed for pktBuf[%d]\n", i);
-            while (true) { delay(500); Serial.print('!'); }
+            BOOTLOGF("FATAL: ps_malloc failed for pktBuf[%d]\n", i);
+            while (true) { delay(500); BOOTLOG('!'); }
         }
         memset(pktBuf[i], 0, MAX_PACKET);
     }
 
     nextBuf = (uint8_t*)ps_malloc(MAX_PACKET);
     if (!nextBuf) {
-        Serial.println("FATAL: ps_malloc failed for nextBuf");
-        while (true) { delay(500); Serial.print('!'); }
+        BOOTLOGLN("FATAL: ps_malloc failed for nextBuf");
+        while (true) { delay(500); BOOTLOG('!'); }
     }
     memset(nextBuf, 0, MAX_PACKET);
 
-    Serial.printf("PSRAM buffers OK (3 x %lu KB).  Free: %lu KB\n",
-                  (unsigned long)(MAX_PACKET / 1024),
-                  (unsigned long)(ESP.getFreePsram() / 1024));
+    BOOTLOGF("PSRAM buffers OK (3 x %lu KB).  Free: %lu KB\n",
+             (unsigned long)(MAX_PACKET / 1024),
+             (unsigned long)(ESP.getFreePsram() / 1024));
 
     swapMutex = xSemaphoreCreateMutex();
     nextMutex = xSemaphoreCreateMutex();
 
-    Serial.println("Initialising matrix...");
+    BOOTLOGLN("Initialising matrix...");
 
     HUB75_I2S_CFG mxconfig(PANEL_WIDTH, PANEL_HEIGHT, PANEL_CHAIN);
     mxconfig.gpio.r1  = PIN_R1;  mxconfig.gpio.g1  = PIN_G1;
@@ -668,33 +678,27 @@ void setup() {
 
     matrix = new MatrixPanel_I2S_DMA(mxconfig);
     if (!matrix->begin()) {
-        Serial.println("FATAL: matrix->begin() failed.");
-        while (true) { delay(500); Serial.print('.'); }
+        BOOTLOGLN("FATAL: matrix->begin() failed.");
+        while (true) { delay(500); BOOTLOG('.'); }
     }
     matrix->setBrightness8(DEFAULT_BRIGHTNESS);
     matrix->clearScreen();
     matrix->flipDMABuffer();
-    Serial.println("Matrix OK.");
+    BOOTLOGLN("Matrix OK.");
 
-    // ── Input modules (v3.0) ──────────────────────────────────────────────
     inputInit();
     inputTaskStart();
 
     xTaskCreatePinnedToCore(displayTask, "display", 8192, nullptr, 2, nullptr, 0);
 
-    Serial.println("Ready.");
-    Serial.println("────────────────────────────────────────");
-    Serial.printf("  Protocol:    v2.0 (header %d B, clock v1.6)\n", HEADER_SIZE);
-    Serial.printf("  Panel:       %dx%d\n", PANEL_WIDTH, REAL_HEIGHT);
-    Serial.printf("  Max frames:  %d  (%lu KB max payload)\n",
-                  MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
-    Serial.printf("  Clock:       6 styles × 7 fonts via clockhelper + fonthelper\n");
-    Serial.printf("  Pomodoro:    split + minimalist layouts via pomodorohelper\n");
-    Serial.printf("  Encoders:    2x KY-040 (ENC1=brightness, ENC2=menu)\n");
-    Serial.printf("  Joystick:    KY-023 (5-way + SW)\n");
-    Serial.printf("  Buttons:     5x SMD tactile (BTN1-BTN5)\n");
-    Serial.println("  Waiting for Frameon packets on USB Serial...");
-    Serial.println("────────────────────────────────────────");
+    BOOTLOGLN("Ready.");
+    BOOTLOGLN("────────────────────────────────────────");
+    BOOTLOGF("  Protocol:    v1.9 (header %d B)\n", HEADER_SIZE);
+    BOOTLOGF("  Panel:       %dx%d\n", PANEL_WIDTH, REAL_HEIGHT);
+    BOOTLOGF("  Max frames:  %d  (%lu KB max payload)\n",
+             MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
+    BOOTLOGLN("  Waiting for Frameon packets on USB Serial...");
+    BOOTLOGLN("────────────────────────────────────────");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
