@@ -1,34 +1,44 @@
 /*
- * Frameon Firmware v3.0 — clock v1.6
+ * Frameon Firmware v4.0 — HID Edition
  * ESP32-S3  ·  P4-2121-64×32 HUB75E
  *
- * v3.0 — Expanded hardware input modules.
- *        2× KY-040 rotary encoders:
- *          · ENC1 → brightness control (CW/CCW ±8, long = reset, press = mode)
- *          · ENC2 → menu navigation / selection
- *        KY-023 analog joystick → directional events, SW button.
- *        5× SMD push buttons (BTN1–BTN5) → short / long-press events.
- *        inputhelper.cpp runs as a FreeRTOS task on Core 1 (priority 2).
- *        Events are queued and drained in loop() via inputApplyEvent().
+ * v4.0 — USB composite device: CDC (FRM packets) + HID (controller input).
+ *        Physical controller reports are sent over the HID interface at USB
+ *        interrupt speed (~4 ms) instead of the old EVT serial-line protocol.
+ *        hidControllerBegin() registers the HID interface with TinyUSB before
+ *        Serial.begin() so both interfaces appear in the composite descriptor.
  *
- * Clock v1.6 — six layout styles (Classic / Analog / WeekdayPrefix /
- *              Stacked / SecondsBar / DualTimezone), full A-Z alphabet in
- *              all 7 fonts, 80-byte header (was 68). Protocol version 0x03.
+ * v3.1 — Expanded hardware input (single KY-040 encoder, KY-023 joystick,
+ *         5× push buttons). inputTask on Core 1 polls at 20 ms.
+ *
+ * v3.0 — Clock v1.6: six layout styles, full A-Z in 7 fonts, 80-byte header.
+ *        Protocol version 0x03.
  *
  * Architecture
  * ────────────
- *   Core 0  displayTask  — render loop: blit frame → overdraw bar → overdraw
- *                          clock → overdraw pomodoro → flip DMA buffer.
- *   Core 1  loop()       — serial receive state machine; swaps pending buffer
- *                          into active slot under mutex on valid packet.
- *   Core 1  inputTask    — polls 2× KY-040 / KY-023 / 5× buttons at 20 ms;
- *                          pushes InputEvent items into inputQueue.
- *                          Spawned from setup() via inputTaskStart().
+ *   Core 0  displayTask — render loop:
+ *             1. renderFrame()           blit RGB565 pixels from PSRAM
+ *             2. overdrawProgressBar()   Spotify bar from millis()
+ *             3. overdrawClock()         live digits from epoch + millis()
+ *             4. overdrawPomodoro()      countdown from millis()
+ *             5. matrix->flipDMABuffer() commit to display
+ *
+ *   Core 1  loop()      — non-blocking serial state machine; swaps pending
+ *                         buffer into active slot under mutex on valid packet.
+ *             inputTask — polls encoder/joystick/buttons at 20 ms; builds
+ *                         FrameonHidReport and calls hidControllerSendIfChanged().
+ *
+ * USB interfaces (composite, no driver install needed on Windows)
+ * ───────────────────────────────────────────────────────────────
+ *   CDC ACM  → COM port for FRM packet send/receive + ACK/NAK/ERR
+ *   HID      → VID 0x303A  PID 0x4001  "Frameon Controller"
+ *              8-byte input reports: enc_delta + joy_xy + buttons + events
  */
 
 #include <Arduino.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include "frameon.h"
+#include "hid_controller.h"
 #include "clockhelper.h"
 #include "pomodorohelper.h"
 #include "waitingscreen.h"
@@ -46,25 +56,24 @@ static int      pendingBuf = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Active display state
-// Written under swapMutex by Core 1 (processPacket), read by Core 0 (displayTask).
-// All fields are volatile to prevent the compiler caching stale values across
-// the mutex boundary on either core.
+// Written under swapMutex by Core 1 (processPacket).
+// Read under swapMutex by Core 0 (displayTask) — all fields volatile.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static volatile int      activeBuf           = 0;
-static volatile int      activeFrameCount    = 0;
-static volatile uint16_t activeFrameDurMs    = 100;
+static volatile int      activeBuf        = 0;
+static volatile int      activeFrameCount = 0;
+static volatile uint16_t activeFrameDurMs = 100;
 
 // Spotify progress bar
-static volatile uint32_t activeStartPosMs    = 0;
-static volatile uint32_t activeTrackDurMs    = 0;
-static volatile uint32_t commitTimeMs        = 0;
-static volatile uint8_t  activeBarX          = 0;
-static volatile uint8_t  activeBarY          = 0;
-static volatile uint8_t  activeBarW          = 0;
-static volatile uint16_t activeBarColor      = 0x11C5;
+static volatile uint32_t activeStartPosMs = 0;
+static volatile uint32_t activeTrackDurMs = 0;
+static volatile uint32_t commitTimeMs     = 0;
+static volatile uint8_t  activeBarX       = 0;
+static volatile uint8_t  activeBarY       = 0;
+static volatile uint8_t  activeBarW       = 0;
+static volatile uint16_t activeBarColor   = 0x11C5;
 
-// Clock overdraw state (v1.5)
+// Clock overdraw (v1.5)
 static volatile uint8_t  activeClockFlags    = 0;
 static volatile uint32_t activeClockEpochSec = 0;
 static volatile int16_t  activeClockTzMin    = 0;
@@ -78,14 +87,14 @@ static volatile uint16_t activeColonColor    = 0x07E0;
 static volatile uint16_t activeDateColor     = 0x07E0;
 static volatile uint16_t activeAmpmColor     = 0x07E0;
 
-// Clock overdraw state (v1.6 extension)
-static volatile uint8_t  activeClockLayoutStyle = 0;   // CLK_LAYOUT_CLASSIC
+// Clock overdraw (v1.6 extension)
+static volatile uint8_t  activeClockLayoutStyle = 0;
 static volatile uint8_t  activeClockAnalogFlags = 0;
 static volatile int16_t  activeClockTz2Min      = 0;
-static char              activeClockLabel1[5]   = {0}; // mutex-protected
+static char              activeClockLabel1[5]   = {0}; // protected by swapMutex
 static char              activeClockLabel2[5]   = {0};
 
-// Pomodoro overdraw state (v1.8)
+// Pomodoro overdraw (v1.8)
 static volatile uint8_t  activePomodoroFlags     = 0;
 static volatile uint32_t activePomodoroRemSec    = 0;
 static volatile uint8_t  activePomodoroPhase     = 0;
@@ -93,7 +102,8 @@ static volatile uint8_t  activePomodoroSession   = 0;
 static volatile int8_t   activePomodoroOffsetX   = 0;
 static volatile int8_t   activePomodoroOffsetY   = 0;
 static volatile uint16_t activePomodoroColor     = 0xFFE0;
-// v1.9 layout fields
+
+// Pomodoro (v1.9)
 static volatile uint8_t  activePomodoroLayout    = 0;
 static volatile uint8_t  activePomodoroSessTotal = 4;
 static volatile uint16_t activePomodoroTotalSec  = 1500;
@@ -205,7 +215,7 @@ static uint16_t crc16(const uint8_t* data, size_t len) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// renderFrame — blit one RGB565 frame from the packet buffer to the matrix
+// renderFrame — blit one RGB565 frame from PSRAM to the matrix
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void renderFrame(int bufIdx, int frameIdx) {
@@ -222,7 +232,7 @@ static void renderFrame(int bufIdx, int frameIdx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// overdrawProgressBar — Spotify 2-px bar, position from millis()
+// overdrawProgressBar — 2-px Spotify progress bar, position from millis()
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
@@ -242,7 +252,7 @@ static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// parseHeader — v2.0  (80-byte header — clock v1.6 extension at [68..79])
+// parseHeader — v2.0 — 80-byte header (clock v1.6 extension at [68..79])
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void parseHeader() {
@@ -270,7 +280,7 @@ static void parseHeader() {
     pktBarW         = h[26];
     pktBarColor     = ((uint16_t)h[27] << 8) | h[28];
 
-    // ── Clock descriptor [29..51] ─────────────────────────────────────────
+    // ── Clock [29..51] ────────────────────────────────────────────────────
     pktClockFlags    = h[29];
     pktClockEpochSec = ((uint32_t)h[30] << 24)
                      | ((uint32_t)h[31] << 16)
@@ -288,7 +298,7 @@ static void parseHeader() {
     pktDateColor     = ((uint16_t)h[48] << 8) | h[49];
     pktAmpmColor     = ((uint16_t)h[50] << 8) | h[51];
 
-    // ── Pomodoro descriptor [52..67] ──────────────────────────────────────
+    // ── Pomodoro [52..67] ─────────────────────────────────────────────────
     pktPomodoroFlags   = h[52];
     pktPomodoroRemSec  = ((uint32_t)h[53] << 24)
                        | ((uint32_t)h[54] << 16)
@@ -304,7 +314,7 @@ static void parseHeader() {
     pktPomodoroTotalSec  = ((uint16_t)h[65] << 8) | h[66];
     // h[67] reserved
 
-    // ── Clock v1.6 extension [68..79] ────────────────────────────────────
+    // ── Clock v1.6 extension [68..79] ─────────────────────────────────────
     pktClockLayoutStyle = h[68];
     pktClockAnalogFlags = h[69];
     pktClockTz2Min      = (int16_t)(((uint16_t)h[70] << 8) | h[71]);
@@ -315,7 +325,7 @@ static void parseHeader() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processPacket — validate CRC, commit to active state or preload next buffer
+// processPacket — validate CRC, then commit or preload next buffer
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void processPacket() {
@@ -324,7 +334,7 @@ static void processPacket() {
     const uint32_t packetLen = HEADER_SIZE + pktPayloadBytes + CRC_SIZE;
     const uint16_t computed  = crc16(buf, HEADER_SIZE + pktPayloadBytes);
     const uint16_t received  = ((uint16_t)buf[HEADER_SIZE + pktPayloadBytes] << 8)
-                              | buf[HEADER_SIZE + pktPayloadBytes + 1];
+                              |            buf[HEADER_SIZE + pktPayloadBytes + 1];
 
     if (computed != received) {
         DLOGF("[NAK] CRC mismatch: computed=0x%04X received=0x%04X\n",
@@ -357,12 +367,13 @@ static void processPacket() {
 
     // ── Normal commit — update active display state ───────────────────────
     xSemaphoreTake(swapMutex, portMAX_DELAY);
+
     activeBuf           = pendingBuf;
     activeFrameCount    = pktFrameCount;
     activeFrameDurMs    = pktDurMs ? pktDurMs : 100;
     activeStartPosMs    = pktStartPosMs;
     activeTrackDurMs    = pktTrackDurMs;
-    commitTimeMs        = millis();   // captured at ACK — used by all overdraw
+    commitTimeMs        = millis();
     activeBarX          = pktBarX;
     activeBarY          = pktBarY;
     activeBarW          = pktBarW;
@@ -412,7 +423,7 @@ static void processPacket() {
     Serial.printf("[ACK] %d frames @ %d ms/frame  clock=%s font=%d layout=%d  "
                   "pomo=%s layout=%d remSec=%lu totalSec=%u\n",
                   pktFrameCount, pktDurMs,
-                  (pktClockFlags    & CLK_FLAG_PRESENT)  ? "yes" : "no",
+                  (pktClockFlags    & CLK_FLAG_PRESENT) ? "yes" : "no",
                   pktClockFontId,
                   pktClockLayoutStyle,
                   (pktPomodoroFlags & POMO_FLAG_PRESENT) ? "yes" : "no",
@@ -424,20 +435,22 @@ static void processPacket() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processSerial — receive state machine, Core 1
+// processSerial — non-blocking receive state machine, Core 1
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void processSerial() {
     uint8_t* buf = pktBuf[pendingBuf];
 
-    // Scan for "FRM" magic
+    // ── Scan for "FRM" magic ──────────────────────────────────────────────
     while (rxState == RX_IDLE && Serial.available()) {
         const uint8_t b = (uint8_t)Serial.read();
         syncBuf[0] = syncBuf[1]; syncBuf[1] = syncBuf[2]; syncBuf[2] = b;
         if (syncBuf[0] == FRM_MAGIC_0 &&
             syncBuf[1] == FRM_MAGIC_1 &&
             syncBuf[2] == FRM_MAGIC_2) {
-            buf[0] = FRM_MAGIC_0; buf[1] = FRM_MAGIC_1; buf[2] = FRM_MAGIC_2;
+            buf[0] = FRM_MAGIC_0;
+            buf[1] = FRM_MAGIC_1;
+            buf[2] = FRM_MAGIC_2;
             rxIdx   = 3;
             rxState = RX_HEADER;
             memset(syncBuf, 0, sizeof(syncBuf));
@@ -445,6 +458,7 @@ static void processSerial() {
         }
     }
 
+    // ── Header ────────────────────────────────────────────────────────────
     if (rxState == RX_HEADER && Serial.available()) {
         const size_t needed = HEADER_SIZE - rxIdx;
         const size_t avail  = (size_t)Serial.available();
@@ -455,18 +469,20 @@ static void processSerial() {
         if (rxIdx == HEADER_SIZE) {
             parseHeader();
             const uint32_t expectedPayload = (uint32_t)pktFrameCount * FRAME_BYTES;
-            const bool ok = (pktWidth == PANEL_WIDTH)
-                         && (pktHeight == REAL_HEIGHT)
-                         && (pktFrameCount > 0)
-                         && (pktFrameCount <= MAX_FRAMES)
+            const bool ok = (pktWidth        == PANEL_WIDTH)
+                         && (pktHeight       == REAL_HEIGHT)
+                         && (pktFrameCount   >  0)
+                         && (pktFrameCount   <= MAX_FRAMES)
                          && (pktPayloadBytes == expectedPayload)
                          && (HEADER_SIZE + pktPayloadBytes + CRC_SIZE <= MAX_PACKET)
                          && (pktFlags == FRM_VERSION || pktFlags == FRM_NEXT);
             if (!ok) {
                 DLOGF("[ERR] Header invalid — w=%d h=%d fc=%d flags=0x%02X\n",
                       pktWidth, pktHeight, pktFrameCount, pktFlags);
-                Serial.write(RESP_ERR); Serial.flush();
-                rxState = RX_IDLE; rxIdx = 0;
+                Serial.write(RESP_ERR);
+                Serial.flush();
+                rxState = RX_IDLE;
+                rxIdx   = 0;
             } else {
                 rxState = RX_PAYLOAD;
                 DLOGF("[RX]  Header OK — %d frames %lu B %d ms/frame\n",
@@ -475,16 +491,19 @@ static void processSerial() {
         }
     }
 
+    // ── Payload ───────────────────────────────────────────────────────────
     if (rxState == RX_PAYLOAD && Serial.available()) {
         const uint32_t payloadEnd = HEADER_SIZE + pktPayloadBytes;
         const uint32_t needed     = payloadEnd - rxIdx;
         const size_t   avail      = (size_t)Serial.available();
-        const size_t   toRead     = (needed < (uint32_t)avail) ? (size_t)needed : (size_t)avail;
+        const size_t   toRead     = (needed < (uint32_t)avail)
+                                    ? (size_t)needed : (size_t)avail;
         Serial.readBytes((char*)buf + rxIdx, toRead);
         rxIdx += (uint32_t)toRead;
         if (rxIdx == payloadEnd) rxState = RX_CRC_H;
     }
 
+    // ── CRC ───────────────────────────────────────────────────────────────
     if (rxState == RX_CRC_H && Serial.available()) {
         buf[rxIdx++] = (uint8_t)Serial.read();
         rxState = RX_CRC_L;
@@ -493,7 +512,8 @@ static void processSerial() {
     if (rxState == RX_CRC_L && Serial.available()) {
         buf[rxIdx++] = (uint8_t)Serial.read();
         processPacket();
-        rxState = RX_IDLE; rxIdx = 0;
+        rxState = RX_IDLE;
+        rxIdx   = 0;
     }
 }
 
@@ -501,11 +521,11 @@ static void processSerial() {
 // displayTask — Core 0
 //
 // Render order every frame:
-//   1. renderFrame()          — blit baked RGB565 pixels from PSRAM
-//   2. overdrawProgressBar()  — Spotify bar position computed from millis()
-//   3. overdrawClock()        — wall-clock digits from millis() + epoch
-//   4. overdrawPomodoro()     — countdown from millis() + remainingSec
-//   5. matrix->flipDMABuffer()— commit the composited frame to the display
+//   1. renderFrame()           blit baked RGB565 pixels from PSRAM
+//   2. overdrawProgressBar()   live Spotify bar from millis()
+//   3. overdrawClock()         live digits from epoch + millis()
+//   4. overdrawPomodoro()      live countdown from millis()
+//   5. matrix->flipDMABuffer() commit composited frame to display
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void displayTask(void* /*param*/) {
@@ -513,54 +533,53 @@ static void displayTask(void* /*param*/) {
     uint32_t taskStart    = millis();
 
     while (true) {
-        // ── Snapshot active state under mutex ─────────────────────────────
+        const uint32_t t0 = millis();
+
+        // ── Snapshot active state (fast, under mutex) ──────────────────────
         xSemaphoreTake(swapMutex, portMAX_DELAY);
-        const int      buf       = activeBuf;
-        const int      count     = activeFrameCount;
-        const uint16_t dur       = activeFrameDurMs;
-        const uint32_t startPos  = activeStartPosMs;
-        const uint32_t trackDur  = activeTrackDurMs;
-        const uint32_t committed = commitTimeMs;
-        const uint8_t  barX      = activeBarX;
-        const uint8_t  barY      = activeBarY;
-        const uint8_t  barW      = activeBarW;
-        const uint16_t barColor  = activeBarColor;
-        // Clock (v1.5)
-        const uint8_t  clockFlags = activeClockFlags;
-        const uint32_t epochSec   = activeClockEpochSec;
-        const int16_t  tzMin      = activeClockTzMin;
-        const uint8_t  clockFont  = activeClockFontId;
-        const int8_t   clockOffX  = activeClockOffsetX;
-        const int8_t   clockOffY  = activeClockOffsetY;
-        const uint16_t hoursCol   = activeHoursColor;
-        const uint16_t minutesCol = activeMinutesColor;
-        const uint16_t secondsCol = activeSecondsColor;
-        const uint16_t colonCol   = activeColonColor;
-        const uint16_t dateCol    = activeDateColor;
-        const uint16_t ampmCol    = activeAmpmColor;
-        // Clock (v1.6)
-        const uint8_t  clockLayout = activeClockLayoutStyle;
-        const uint8_t  analogFlags = activeClockAnalogFlags;
-        const int16_t  tzMin2      = activeClockTz2Min;
-        char           clockLbl1[5], clockLbl2[5];
-        for (int i = 0; i < 5; i++) {
-            clockLbl1[i] = activeClockLabel1[i];
-            clockLbl2[i] = activeClockLabel2[i];
-        }
-        // Pomodoro (v1.8 + v1.9)
-        const uint8_t  pomoFlags     = activePomodoroFlags;
-        const uint32_t pomoRemSec    = activePomodoroRemSec;
-        const uint8_t  pomoPhase     = activePomodoroPhase;
-        const uint8_t  pomoSession   = activePomodoroSession;
-        const int8_t   pomoOffX      = activePomodoroOffsetX;
-        const int8_t   pomoOffY      = activePomodoroOffsetY;
-        const uint16_t pomoColor     = activePomodoroColor;
-        const uint8_t  pomoLayout    = activePomodoroLayout;
-        const uint8_t  pomoSessTotal = activePomodoroSessTotal;
-        const uint32_t pomoTotalSec  = activePomodoroTotalSec;
+
+        const int      buf          = activeBuf;
+        const int      count        = activeFrameCount;
+        const uint16_t dur          = activeFrameDurMs;
+        const uint32_t startPos     = activeStartPosMs;
+        const uint32_t trackDur     = activeTrackDurMs;
+        const uint32_t committed    = commitTimeMs;
+        const uint8_t  barX         = activeBarX;
+        const uint8_t  barY         = activeBarY;
+        const uint8_t  barW         = activeBarW;
+        const uint16_t barColor     = activeBarColor;
+        const uint8_t  clockFlags   = activeClockFlags;
+        const uint32_t epochSec     = activeClockEpochSec;
+        const int16_t  tzMin        = activeClockTzMin;
+        const int16_t  tzMin2       = activeClockTz2Min;
+        const uint8_t  clockFont    = activeClockFontId;
+        const int8_t   clockOffX    = activeClockOffsetX;
+        const int8_t   clockOffY    = activeClockOffsetY;
+        const uint16_t hoursCol     = activeHoursColor;
+        const uint16_t minutesCol   = activeMinutesColor;
+        const uint16_t secondsCol   = activeSecondsColor;
+        const uint16_t colonCol     = activeColonColor;
+        const uint16_t dateCol      = activeDateColor;
+        const uint16_t ampmCol      = activeAmpmColor;
+        const uint8_t  clockLayout  = activeClockLayoutStyle;
+        const uint8_t  analogFlags  = activeClockAnalogFlags;
+        char label1[5], label2[5];
+        memcpy(label1, activeClockLabel1, 5);
+        memcpy(label2, activeClockLabel2, 5);
+        const uint8_t  pomoFlags    = activePomodoroFlags;
+        const uint32_t pomoRemSec   = activePomodoroRemSec;
+        const uint8_t  pomoPhase    = activePomodoroPhase;
+        const uint8_t  pomoLayout   = activePomodoroLayout;
+        const uint8_t  pomoSession  = activePomodoroSession;
+        const uint8_t  pomoSessTotal= activePomodoroSessTotal;
+        const int8_t   pomoOffX     = activePomodoroOffsetX;
+        const int8_t   pomoOffY     = activePomodoroOffsetY;
+        const uint16_t pomoColor    = activePomodoroColor;
+        const uint32_t pomoTotalSec = activePomodoroTotalSec;
+
         xSemaphoreGive(swapMutex);
 
-        // ── Idle splash ───────────────────────────────────────────────────
+        // ── Nothing to show — idle splash ─────────────────────────────────
         if (count == 0) {
             showWaitingScreen(millis() - taskStart);
             matrix->flipDMABuffer();
@@ -568,37 +587,84 @@ static void displayTask(void* /*param*/) {
             continue;
         }
 
-        // ── Reset frame counter if a new packet just arrived ──────────────
+        // ── Spotify next-song swap ────────────────────────────────────────
+        // If a next-song buffer is ready and playback has reached the end
+        // of the current track, atomically swap it in.
+        if (nextBufReady && trackDur > 0) {
+            const uint32_t elapsed  = millis() - committed;
+            const uint32_t livePos  = startPos + elapsed;
+            if (livePos >= trackDur) {
+                xSemaphoreTake(nextMutex, portMAX_DELAY);
+                if (nextBufReady) {
+                    // Copy next-buffer state into active slot
+                    const int nextSlot = 1 - activeBuf;
+                    memcpy(pktBuf[nextSlot], nextBuf,
+                           HEADER_SIZE + (uint32_t)nextFrameCount * FRAME_BYTES + CRC_SIZE);
+
+                    xSemaphoreTake(swapMutex, portMAX_DELAY);
+                    activeBuf        = nextSlot;
+                    activeFrameCount = nextFrameCount;
+                    activeFrameDurMs = nextFrameDurMs;
+                    activeStartPosMs = 0;
+                    activeTrackDurMs = nextTrackDurMs;
+                    commitTimeMs     = millis();
+                    activeBarX       = nextBarX;
+                    activeBarY       = nextBarY;
+                    activeBarW       = nextBarW;
+                    activeBarColor   = nextBarColor;
+                    xSemaphoreGive(swapMutex);
+
+                    nextBufReady  = false;
+                    currentFrame  = 0;
+                }
+                xSemaphoreGive(nextMutex);
+                continue; // re-snapshot with new active state
+            }
+        }
+
+        // Clamp frame index for safety
         if (currentFrame >= count) currentFrame = 0;
 
         const uint32_t t0 = millis();
 
-        // 1. Blit baked RGB565 frame from PSRAM
+        // ── 1. Blit base frame ─────────────────────────────────────────────
         renderFrame(buf, currentFrame);
 
-        // 2. Spotify progress bar (live position from millis())
-        const uint32_t wallMs    = millis() - committed;
-        const uint32_t songPosMs = startPos + wallMs;
-        overdrawProgressBar(songPosMs, trackDur, barX, barY, barW, barColor);
-
-        // 3. Clock (live wall time from millis() + epoch)
-        if (clockFlags & CLK_FLAG_PRESENT) {
-            overdrawClock(
-                epochSec, wallMs,
-                tzMin,  tzMin2,
-                clockFlags, clockLayout, analogFlags, clockFont,
-                clockOffX, clockOffY,
-                hoursCol, minutesCol, secondsCol,
-                colonCol, dateCol, ampmCol,
-                clockLbl1, clockLbl2);
+        // ── 2. Spotify progress bar ────────────────────────────────────────
+        if (barW > 0 && trackDur > 0) {
+            const uint32_t livePos = startPos + (millis() - committed);
+            overdrawProgressBar(livePos, trackDur, barX, barY, barW, barColor);
         }
 
-        // 4. Pomodoro countdown (live remaining time from millis()) — v1.9
+        // ── 3. Clock overdraw ─────────────────────────────────────────────
+        if (clockFlags & CLK_FLAG_PRESENT) {
+            overdrawClock(
+                epochSec,
+                millis() - committed,
+                tzMin,
+                tzMin2,
+                clockFlags,
+                clockLayout,
+                analogFlags,
+                clockFont,
+                clockOffX,
+                clockOffY,
+                hoursCol,
+                minutesCol,
+                secondsCol,
+                colonCol,
+                dateCol,
+                ampmCol,
+                label1,
+                label2);
+        }
+
+        // ── 4. Pomodoro countdown ─────────────────────────────────────────
         if (pomoFlags & POMO_FLAG_PRESENT) {
             overdrawPomodoro(
                 pomoRemSec,
                 pomoTotalSec,
-                wallMs,
+                millis(),
                 pomoPhase,
                 pomoLayout,
                 pomoFlags,
@@ -609,9 +675,10 @@ static void displayTask(void* /*param*/) {
                 pomoColor);
         }
 
-        // 5. Commit all layers atomically to the display
+        // ── 5. Commit to display ──────────────────────────────────────────
         matrix->flipDMABuffer();
 
+        // ── Advance frame, respect per-frame duration ─────────────────────
         const uint32_t elapsed  = millis() - t0;
         currentFrame = (currentFrame + 1) % count;
         const int32_t remaining = (int32_t)dur - (int32_t)elapsed;
@@ -624,21 +691,29 @@ static void displayTask(void* /*param*/) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
-    // ── CRITICAL: buffer sizing must come BEFORE Serial.begin() ──────────
-    // Default RX buffer is 256 bytes = ~2.8 ms at 921600 baud. Any time
-    // loop() spends in Serial.println/printf or gets preempted by
-    // inputTask for longer than that, the UART RX FIFO overflows silently
-    // (no flow control on the CH340N bridge). 8 KB gives ~89 ms headroom.
+    // ── 1. HID — MUST register before Serial.begin() ─────────────────────
+    // TinyUSB builds the composite device descriptor once, before the USB
+    // stack starts.  hidControllerBegin() calls USB.VID/PID/productName and
+    // hid.begin() which adds the HID interface alongside the CDC interface.
+    // Calling Serial.begin() after this is safe — it merely opens the CDC
+    // endpoint that TinyUSB already registered.
+    hidControllerBegin();
+
+    // ── 2. CDC serial — FRM packet bus ────────────────────────────────────
+    // Buffer sizing BEFORE begin(): default 256 B RX = ~2.8 ms at 921600.
+    // 8 KB gives ~89 ms headroom for the inputTask preemption window.
     Serial.setRxBufferSize(8192);
-    Serial.setTxBufferSize(2048);
     Serial.begin(921600);
     delay(200);
 
-    BOOTLOGLN("\n\nFrameon Firmware v3.1");
+    BOOTLOGLN("\n\nFrameon Firmware v4.0 (HID edition)");
     BOOTLOGLN("════════════════════════════════════════");
+    BOOTLOGF("  USB:         CDC (FRM) + HID (controller)  VID=0x%04X PID=0x%04X\n",
+             FRAMEON_USB_VID, FRAMEON_USB_PID);
     BOOTLOGF("  RX buffer:   %u B\n", 8192);
     BOOTLOGF("  TX buffer:   %u B\n", 2048);
 
+    // ── 3. PSRAM double-buffer ────────────────────────────────────────────
     for (int i = 0; i < 2; i++) {
         pktBuf[i] = (uint8_t*)ps_malloc(MAX_PACKET);
         if (!pktBuf[i]) {
@@ -655,15 +730,16 @@ void setup() {
     }
     memset(nextBuf, 0, MAX_PACKET);
 
-    BOOTLOGF("PSRAM buffers OK (3 x %lu KB).  Free: %lu KB\n",
+    BOOTLOGF("PSRAM OK  (3 × %lu KB)   Free: %lu KB\n",
              (unsigned long)(MAX_PACKET / 1024),
              (unsigned long)(ESP.getFreePsram() / 1024));
 
+    // ── 4. FreeRTOS synchronisation ───────────────────────────────────────
     swapMutex = xSemaphoreCreateMutex();
     nextMutex = xSemaphoreCreateMutex();
 
+    // ── 5. LED matrix ────────────────────────────────────────────────────
     BOOTLOGLN("Initialising matrix...");
-
     HUB75_I2S_CFG mxconfig(PANEL_WIDTH, PANEL_HEIGHT, PANEL_CHAIN);
     mxconfig.gpio.r1  = PIN_R1;  mxconfig.gpio.g1  = PIN_G1;
     mxconfig.gpio.b1  = PIN_B1;  mxconfig.gpio.r2  = PIN_R2;
@@ -686,16 +762,18 @@ void setup() {
     matrix->flipDMABuffer();
     BOOTLOGLN("Matrix OK.");
 
-    inputInit();
-    inputTaskStart();
+    // ── 6. Physical input task (Core 1, priority 1) ───────────────────────
+    inputInit();       // calibrates joystick, attaches encoder ISR
+    inputTaskStart();  // spawns FreeRTOS task that sends HID reports
 
+    // ── 7. Display task (Core 0, priority 2) ─────────────────────────────
     xTaskCreatePinnedToCore(displayTask, "display", 8192, nullptr, 2, nullptr, 0);
 
     BOOTLOGLN("Ready.");
     BOOTLOGLN("────────────────────────────────────────");
-    BOOTLOGF("  Protocol:    v1.9 (header %d B)\n", HEADER_SIZE);
-    BOOTLOGF("  Panel:       %dx%d\n", PANEL_WIDTH, REAL_HEIGHT);
-    BOOTLOGF("  Max frames:  %d  (%lu KB max payload)\n",
+    BOOTLOGF("  Protocol:   v1.9  (header %d B)\n",  HEADER_SIZE);
+    BOOTLOGF("  Panel:      %d × %d px\n",            PANEL_WIDTH, REAL_HEIGHT);
+    BOOTLOGF("  Max frames: %d   (%lu KB max payload)\n",
              MAX_FRAMES, (unsigned long)(MAX_PAYLOAD / 1024));
     BOOTLOGLN("  Waiting for Frameon packets on USB Serial...");
     BOOTLOGLN("────────────────────────────────────────");
@@ -703,11 +781,17 @@ void setup() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // loop — Core 1
+//
+// Drains the input queue for any firmware-local actions (currently only the
+// displayLocked toggle from encoder long-hold).
+// HID reports are sent directly from inputTask — this loop is now lightweight.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
     processSerial();
 
+    // inputApplyEvent is a stub in the HID build; the queue is kept only for
+    // displayLocked signalling and future firmware-local actions.
     InputEventType evt;
     while (xQueueReceive(inputQueue, &evt, 0) == pdTRUE) {
         inputApplyEvent(evt, matrix);
