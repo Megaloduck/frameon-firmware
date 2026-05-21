@@ -533,8 +533,6 @@ static void displayTask(void* /*param*/) {
     uint32_t taskStart    = millis();
 
     while (true) {
-        const uint32_t t0 = millis();
-
         // ── Snapshot active state (fast, under mutex) ──────────────────────
         xSemaphoreTake(swapMutex, portMAX_DELAY);
 
