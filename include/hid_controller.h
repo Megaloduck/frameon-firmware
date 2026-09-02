@@ -1,58 +1,62 @@
+// include/hid_controller.h
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// Frameon USB HID controller — composite CDC + HID on ESP32-S3 native USB.
+//
+// ── FIX: HID report struct updated to match Dart hid_report.dart ─────────────
+//
+//  OLD struct (caused "app can't send display" bug):
+//    int8_t   encDelta;
+//    uint16_t joyX;
+//    uint16_t joyY;       ← raw ADC, 2 bytes
+//    uint8_t  buttons;
+//    uint8_t  events;     ← no taps field
+//
+//  NEW struct (matches Dart hid_report.dart layout):
+//    int8_t   encDelta;
+//    uint16_t joyX;
+//    uint8_t  brightness; ← firmware-applied brightness (1 byte, was joyY uint16)
+//    uint8_t  buttons;
+//    uint8_t  events;
+//    uint8_t  taps;       ← short-press one-shot bitmask (new field)
+//
+//  Why the old struct broke sendToDevice():
+//    Dart's hid_report.dart reads byte[6] as `events` and bit 0 as `encLong`.
+//    With the old struct, byte[6] is the firmware's `buttons` (held-button
+//    bitmask, not one-shot). Bit 0 of buttons = HID_BTN_ENC_PRESS.
+//    Result: `encLong` fired on every HID report while the encoder button was
+//    physically held — toggling deviceLocked true/false at 20 ms intervals.
+//    Whenever deviceLocked was true during a send attempt, sendToDevice()
+//    returned early with "Display is locked." even though it wasn't.
+//
+//    Additionally, short-press (tap) events were never put in any field —
+//    `pb()` discarded r==1 (short release), so btn1Tap/btn2Tap/… were always
+//    false, and BTN1 "Sync display" never fired.
+//
+//  Fix:
+//    1. Replace uint16_t joyY with uint8_t brightness + uint8_t taps (total
+//       payload stays 7 bytes — no size change, no Windows driver reinstall).
+//    2. Add HID_TAP_* bitmask defines matching kHidTap* in Dart.
+//    3. Update the HID descriptor in hid_controller.cpp to describe the new layout.
+//    4. Update inputhelper.cpp to:
+//         • Fill report.brightness from displayBrightness (adjusted by joyY).
+//         • Fill report.taps for short-press releases (r==1 in Button::poll).
+//         • Remove report.joyY.
+// ─────────────────────────────────────────────────────────────────────────────
+
 #pragma once
 
-// ─────────────────────────────────────────────────────────────────────────────
-// hid_controller.h — USB HID input reports for the Frameon physical controller
-//
-// The ESP32-S3 presents as a USB composite device:
-//   Interface 0/1: CDC ACM  — FRM packet send/receive (unchanged)
-//   Interface 2:   HID      — controller input reports (this file)
-//
-// Windows uses the built-in HID class driver (hid.sys) for Interface 2 so
-// no custom driver or INF is needed.  The device enumerates as:
-//   VID 0x303A  PID 0x4001  "Frameon Controller"
-//
-// HID Report (Report ID = 0x01, payload = 7 bytes, total on wire = 8 bytes)
-// ────────────────────────────────────────────────────────────────────────────
-//  Offset  Field          Type    Range        Description
-//   0      report_id      uint8   always 1     report identifier
-//   1      enc_delta      int8    −127…+127    encoder steps since last report
-//                                              + = CW (preset +)  − = CCW (−)
-//   2-3    joy_x          uint16  0…4095       raw ADC, calibrated by app
-//   4-5    joy_y          uint16  0…4095       raw ADC
-//   6      buttons        uint8   bitmask      button currently held (see masks)
-//   7      events         uint8   bitmask      one-shot events cleared each report
-//
-// buttons bitmask (field byte 6)
-//   bit 0  ENC_PRESS   encoder button held down
-//   bit 1  JOY_PRESS   joystick SW held down
-//   bit 2  BTN1        push button 1
-//   bit 3  BTN2        push button 2
-//   bit 4  BTN3        push button 3
-//   bit 5  BTN4        push button 4
-//   bit 6  BTN5        push button 5
-//   bit 7  reserved
-//
-// events bitmask (field byte 7) — set for one report cycle then cleared
-//   bit 0  ENC_LONG    encoder long-hold fired
-//   bit 1  JOY_LONG    joystick SW long-hold fired
-//   bit 2  BTN1_LONG   BTN1 long-hold
-//   bit 3  BTN2_LONG   BTN2 long-hold
-//   bit 4  BTN3_LONG   BTN3 long-hold
-//   bit 5  BTN4_LONG   BTN4 long-hold
-//   bit 6  BTN5_LONG   BTN5 long-hold
-//   bit 7  reserved
-// ─────────────────────────────────────────────────────────────────────────────
-
 #include <stdint.h>
-#include <stdbool.h>
 
-// ── USB identifiers ───────────────────────────────────────────────────────────
-#define FRAMEON_USB_VID      0x303A  // Espressif Systems
-#define FRAMEON_USB_PID      0x4001  // Frameon Controller
-#define FRAMEON_HID_REPORT_ID  0x01
-#define FRAMEON_HID_REPORT_SIZE  7   // payload bytes (excluding report ID)
+// ── USB identity ───────────────────────────────────────────────────────────────
+#define FRAMEON_USB_VID  0x303A
+#define FRAMEON_USB_PID  0x4001
 
-// ── Button bitmasks ───────────────────────────────────────────────────────────
+// ── HID report constants ───────────────────────────────────────────────────────
+#define FRAMEON_HID_REPORT_ID    1
+#define FRAMEON_HID_REPORT_SIZE  7   // bytes of payload (excl. report ID)
+
+// ── Button masks (buttons field — held state) ──────────────────────────────────
 #define HID_BTN_ENC_PRESS  (1 << 0)
 #define HID_BTN_JOY_PRESS  (1 << 1)
 #define HID_BTN_1          (1 << 2)
@@ -61,7 +65,7 @@
 #define HID_BTN_4          (1 << 5)
 #define HID_BTN_5          (1 << 6)
 
-// ── Event bitmasks (one-shot) ─────────────────────────────────────────────────
+// ── Event masks — long-press one-shot (events field) ──────────────────────────
 #define HID_EVT_ENC_LONG   (1 << 0)
 #define HID_EVT_JOY_LONG   (1 << 1)
 #define HID_EVT_BTN1_LONG  (1 << 2)
@@ -70,36 +74,48 @@
 #define HID_EVT_BTN4_LONG  (1 << 5)
 #define HID_EVT_BTN5_LONG  (1 << 6)
 
-// ── Report struct (matches on-wire layout) ────────────────────────────────────
+// ── Tap masks — short-press one-shot (taps field) ─────────────────────────────
+// FIX: new field. Bit positions match kHidTap* in Dart's hid_report.dart.
+#define HID_TAP_ENC   (1 << 0)
+#define HID_TAP_JOY   (1 << 1)
+#define HID_TAP_BTN1  (1 << 2)
+#define HID_TAP_BTN2  (1 << 3)
+#define HID_TAP_BTN3  (1 << 4)
+#define HID_TAP_BTN4  (1 << 5)
+#define HID_TAP_BTN5  (1 << 6)
+
+// ── Report struct ──────────────────────────────────────────────────────────────
+// FIX: uint16_t joyY removed; uint8_t brightness + uint8_t taps added.
+// sizeof == 7 bytes (unchanged) so FRAMEON_HID_REPORT_SIZE is still correct
+// and Windows does not require a driver reinstall (same report size).
+// The HID descriptor in hid_controller.cpp is updated to match.
 #pragma pack(push, 1)
 typedef struct {
-    int8_t   encDelta;   // encoder steps since last report
-    uint16_t joyX;       // raw ADC 0–4095
-    uint16_t joyY;       // raw ADC 0–4095
-    uint8_t  buttons;    // currently-held buttons bitmask
-    uint8_t  events;     // one-shot events bitmask
+    int8_t   encDelta;    // encoder steps since last report (+CW, -CCW)
+    uint16_t joyX;        // raw ADC 0-4095 (app applies dead-zone + calibration)
+    uint8_t  brightness;  // FIX: was joyY uint16. Now: firmware-applied display
+                          //      brightness 0-255, updated by joystick Y in inputTask.
+    uint8_t  buttons;     // held-button bitmask (HID_BTN_*)
+    uint8_t  events;      // long-press one-shot bitmask (HID_EVT_*)
+    uint8_t  taps;        // FIX: new field. Short-press one-shot (HID_TAP_*).
+                          //      Was discarded by old pb() lambda (r==1 case ignored).
 } FrameonHidReport;
 #pragma pack(pop)
 
 static_assert(sizeof(FrameonHidReport) == FRAMEON_HID_REPORT_SIZE,
-              "HID report size mismatch");
+              "HID report size mismatch — check struct vs FRAMEON_HID_REPORT_SIZE");
 
 // ── HID descriptor ─────────────────────────────────────────────────────────────
-// Vendor-defined usage page (0xFF00).  Windows HID class driver loads without
-// any INF or driver install.  Report ID 1 wraps the 7-byte FrameonHidReport.
 extern const uint8_t  kFrameonHidDescriptor[];
 extern const uint16_t kFrameonHidDescriptorLen;
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Public API ─────────────────────────────────────────────────────────────────
 
-/// Call once from setup(), BEFORE Serial.begin(), so TinyUSB registers
-/// both the CDC and HID interfaces before the USB stack starts.
+/// Call once from setup(), BEFORE Serial.begin().
 void hidControllerBegin();
 
-/// Call from loop() or the input task after computing the new report state.
-/// Sends the HID report to the host if any field changed since the last send.
-/// Returns true if a report was sent, false if nothing changed or USB not ready.
+/// Send report if changed. Returns true if a report was sent.
 bool hidControllerSendIfChanged(const FrameonHidReport& report);
 
-/// Force-send a report regardless of whether it changed (useful on connect).
+/// Force-send regardless of change (e.g. on connect).
 bool hidControllerSendReport(const FrameonHidReport& report);
