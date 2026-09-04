@@ -1,18 +1,12 @@
 /*
- * Frameon Firmware v4.0 — HID Edition
+ * Frameon Firmware v4.1 — HID Edition
  * ESP32-S3  ·  P4-2121-64×32 HUB75E
  *
+ * v4.1 — Three serial-receive bugs fixed (see FIX notes below).
+ *
  * v4.0 — USB composite device: CDC (FRM packets) + HID (controller input).
- *        Physical controller reports are sent over the HID interface at USB
- *        interrupt speed (~4 ms) instead of the old EVT serial-line protocol.
  *        hidControllerBegin() registers the HID interface with TinyUSB before
  *        Serial.begin() so both interfaces appear in the composite descriptor.
- *
- * v3.1 — Expanded hardware input (single KY-040 encoder, KY-023 joystick,
- *         5× push buttons). inputTask on Core 1 polls at 20 ms.
- *
- * v3.0 — Clock v1.6: six layout styles, full A-Z in 7 fonts, 80-byte header.
- *        Protocol version 0x03.
  *
  * Architecture
  * ────────────
@@ -33,6 +27,43 @@
  *   CDC ACM  → COM port for FRM packet send/receive + ACK/NAK/ERR
  *   HID      → VID 0x303A  PID 0x4001  "Frameon Controller"
  *              8-byte input reports: enc_delta + joy_xy + buttons + events
+ *
+ * ── FIX v4.1 (three bugs) ────────────────────────────────────────────────────
+ *
+ *  FIX 1 — Missing Serial.setTxBufferSize(2048).
+ *   The setup code called Serial.setRxBufferSize(8192) but omitted the TX side.
+ *   The boot log hardcoded "TX buffer: 2048 B" which was a misleading comment,
+ *   not a reflection of any actual call.  Without the call the Arduino CDC TX
+ *   ring buffer stays at the default (64 B — exactly one USB full-speed packet).
+ *   processPacket() prints a 200+ byte DLOGF string before Serial.write(RESP_ACK).
+ *   That string fills the tiny ring buffer; the ACK byte must wait for TinyUSB to
+ *   drain it.  Under the composite CDC+HID configuration, TinyUSB only gets CPU
+ *   time when loop() yields via vTaskDelay, introducing unpredictable latency.
+ *   With Serial.setTxBufferSize(2048) the entire DLOGF + ACK fit in one ring-
+ *   buffer fill, and Serial.flush() drains them in a single TinyUSB wake-up.
+ *
+ *  FIX 2 — processSerial() ignored Serial.readBytes() return value.
+ *   The payload receive block did:
+ *       Serial.readBytes((char*)buf + rxIdx, toRead);
+ *       rxIdx += (uint32_t)toRead;          ← always used requested count
+ *   Serial.readBytes() returns the number of bytes ACTUALLY read, which can be
+ *   less than toRead if the stream timeout fires.  Using toRead unconditionally
+ *   advanced rxIdx past un-written memory, so the CRC was computed over garbage,
+ *   the firmware sent NAK, and the app retried — only to time out again because
+ *   (without FIX 1) the NAK byte also sat unflushed.  Fixed by capturing the
+ *   return value and using it for rxIdx.
+ *
+ *  FIX 3 — processSerial() ran at most once per vTaskDelay(1) tick.
+ *   loop() called processSerial() exactly once per millisecond.  Each call
+ *   consumed only the bytes currently in the RX ring buffer.  For a 1.2 MB
+ *   packet at 921600 baud (~10 s transfer), the 8 KB RX ring fills every ~87 ms.
+ *   If processSerial() ever fell behind — e.g. because inputTask preempted loop()
+ *   for a HID report — bytes could be silently dropped by the UART/USB driver,
+ *   leaving the state machine stuck in RX_PAYLOAD forever and no ACK being sent.
+ *   Fixed by wrapping processSerial() in a spin-loop that drains all available
+ *   serial data before yielding.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 #include <Arduino.h>
@@ -51,7 +82,8 @@ MatrixPanel_I2S_DMA* matrix = nullptr;
 // Double-buffer PSRAM storage
 // ─────────────────────────────────────────────────────────────────────────────
 
-static uint8_t* pktBuf[2] = {nullptr, nullptr};
+static uint8_t* pktBuf[2]  = {nullptr, nullptr};
+static uint8_t* nextBuf    = nullptr;
 static int      pendingBuf = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,23 +92,24 @@ static int      pendingBuf = 0;
 // Read under swapMutex by Core 0 (displayTask) — all fields volatile.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static volatile int      activeBuf        = 0;
-static volatile int      activeFrameCount = 0;
-static volatile uint16_t activeFrameDurMs = 100;
+static SemaphoreHandle_t swapMutex = nullptr;
+static SemaphoreHandle_t nextMutex = nullptr;
 
-// Spotify progress bar
-static volatile uint32_t activeStartPosMs = 0;
-static volatile uint32_t activeTrackDurMs = 0;
-static volatile uint32_t commitTimeMs     = 0;
-static volatile uint8_t  activeBarX       = 0;
-static volatile uint8_t  activeBarY       = 0;
-static volatile uint8_t  activeBarW       = 0;
-static volatile uint16_t activeBarColor   = 0x11C5;
+static volatile int      activeBuf           = 0;
+static volatile int      activeFrameCount    = 0;
+static volatile uint16_t activeFrameDurMs    = 100;
+static volatile uint32_t activeStartPosMs    = 0;
+static volatile uint32_t activeTrackDurMs    = 0;
+static volatile uint32_t commitTimeMs        = 0;
+static volatile uint8_t  activeBarX          = 0;
+static volatile uint8_t  activeBarY          = 0;
+static volatile uint8_t  activeBarW          = 0;
+static volatile uint16_t activeBarColor      = 0x11C5;
 
-// Clock overdraw (v1.5)
 static volatile uint8_t  activeClockFlags    = 0;
 static volatile uint32_t activeClockEpochSec = 0;
 static volatile int16_t  activeClockTzMin    = 0;
+static volatile int16_t  activeClockTz2Min   = 0;
 static volatile uint8_t  activeClockFontId   = 0;
 static volatile int8_t   activeClockOffsetX  = 0;
 static volatile int8_t   activeClockOffsetY  = 0;
@@ -86,45 +119,32 @@ static volatile uint16_t activeSecondsColor  = 0x07E0;
 static volatile uint16_t activeColonColor    = 0x07E0;
 static volatile uint16_t activeDateColor     = 0x07E0;
 static volatile uint16_t activeAmpmColor     = 0x07E0;
+static volatile uint8_t  activeClockLayout   = 0;
+static volatile uint8_t  activeAnalogFlags   = 0;
+static volatile char     activeLabel1[5]     = {0};
+static volatile char     activeLabel2[5]     = {0};
 
-// Clock overdraw (v1.6 extension)
-static volatile uint8_t  activeClockLayoutStyle = 0;
-static volatile uint8_t  activeClockAnalogFlags = 0;
-static volatile int16_t  activeClockTz2Min      = 0;
-static char              activeClockLabel1[5]   = {0}; // protected by swapMutex
-static char              activeClockLabel2[5]   = {0};
+static volatile uint8_t  activePomodoroFlags    = 0;
+static volatile uint32_t activePomodoroRemSec   = 0;
+static volatile uint8_t  activePomodoroPhase    = 0;
+static volatile uint8_t  activePomodoroSession  = 0;
+static volatile uint8_t  activePomodoroLayout   = 0;
+static volatile uint8_t  activePomodoroSessTotal= 4;
+static volatile uint16_t activePomodoroTotalSec = 1500;
+static volatile int8_t   activePomodoroOffsetX  = 0;
+static volatile int8_t   activePomodoroOffsetY  = 0;
+static volatile uint16_t activePomodoroColor    = 0xFFE0;
 
-// Pomodoro overdraw (v1.8)
-static volatile uint8_t  activePomodoroFlags     = 0;
-static volatile uint32_t activePomodoroRemSec    = 0;
-static volatile uint8_t  activePomodoroPhase     = 0;
-static volatile uint8_t  activePomodoroSession   = 0;
-static volatile int8_t   activePomodoroOffsetX   = 0;
-static volatile int8_t   activePomodoroOffsetY   = 0;
-static volatile uint16_t activePomodoroColor     = 0xFFE0;
-
-// Pomodoro (v1.9)
-static volatile uint8_t  activePomodoroLayout    = 0;
-static volatile uint8_t  activePomodoroSessTotal = 4;
-static volatile uint16_t activePomodoroTotalSec  = 1500;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Next-song preload (Spotify)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static uint8_t*          nextBuf        = nullptr;
+// Next-song preload buffer
 static volatile bool     nextBufReady   = false;
 static volatile int      nextFrameCount = 0;
-static volatile uint16_t nextFrameDurMs = 100;
+static volatile uint16_t nextFrameDurMs = 0;
 static volatile uint32_t nextStartPosMs = 0;
 static volatile uint32_t nextTrackDurMs = 0;
 static volatile uint8_t  nextBarX       = 0;
 static volatile uint8_t  nextBarY       = 0;
 static volatile uint8_t  nextBarW       = 0;
 static volatile uint16_t nextBarColor   = 0x11C5;
-
-static SemaphoreHandle_t swapMutex = nullptr;
-static SemaphoreHandle_t nextMutex = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Serial receive state machine
@@ -137,41 +157,38 @@ static uint32_t rxIdx      = 0;
 static uint8_t  syncBuf[3] = {0, 0, 0};
 
 // Parsed packet fields (Core 1 only — no volatile needed)
-static uint8_t  pktFlags        = FRM_VERSION;
-static uint16_t pktFrameCount   = 0;
-static uint16_t pktWidth        = 0;
-static uint16_t pktHeight       = 0;
-static uint16_t pktDurMs        = 0;
-static uint32_t pktPayloadBytes = 0;
-static uint32_t pktStartPosMs   = 0;
-static uint32_t pktTrackDurMs   = 0;
-static uint8_t  pktBarX         = 0;
-static uint8_t  pktBarY         = 0;
-static uint8_t  pktBarW         = 0;
-static uint16_t pktBarColor     = 0x11C5;
+static uint8_t  pktFlags          = FRM_VERSION;
+static uint16_t pktFrameCount     = 0;
+static uint16_t pktWidth          = 0;
+static uint16_t pktHeight         = 0;
+static uint16_t pktDurMs          = 0;
+static uint32_t pktPayloadBytes   = 0;
+static uint32_t pktStartPosMs     = 0;
+static uint32_t pktTrackDurMs     = 0;
+static uint8_t  pktBarX           = 0;
+static uint8_t  pktBarY           = 0;
+static uint8_t  pktBarW           = 0;
+static uint16_t pktBarColor       = 0x11C5;
 
-// Clock (v1.5)
-static uint8_t  pktClockFlags    = 0;
-static uint32_t pktClockEpochSec = 0;
-static int16_t  pktClockTzMin    = 0;
-static uint8_t  pktClockFontId   = 0;
-static int8_t   pktClockOffsetX  = 0;
-static int8_t   pktClockOffsetY  = 0;
-static uint16_t pktHoursColor    = 0x07E0;
-static uint16_t pktMinutesColor  = 0x07E0;
-static uint16_t pktSecondsColor  = 0x07E0;
-static uint16_t pktColonColor    = 0x07E0;
-static uint16_t pktDateColor     = 0x07E0;
-static uint16_t pktAmpmColor     = 0x07E0;
+static uint8_t  pktClockFlags     = 0;
+static uint32_t pktClockEpochSec  = 0;
+static int16_t  pktClockTzMin     = 0;
+static uint8_t  pktClockFontId    = 0;
+static int8_t   pktClockOffsetX   = 0;
+static int8_t   pktClockOffsetY   = 0;
+static uint16_t pktHoursColor     = 0x07E0;
+static uint16_t pktMinutesColor   = 0x07E0;
+static uint16_t pktSecondsColor   = 0x07E0;
+static uint16_t pktColonColor     = 0x07E0;
+static uint16_t pktDateColor      = 0x07E0;
+static uint16_t pktAmpmColor      = 0x07E0;
 
-// Clock (v1.6 extension)
 static uint8_t  pktClockLayoutStyle = 0;
 static uint8_t  pktClockAnalogFlags = 0;
 static int16_t  pktClockTz2Min      = 0;
 static char     pktClockLabel1[5]   = {0};
 static char     pktClockLabel2[5]   = {0};
 
-// Pomodoro (v1.8)
 static uint8_t  pktPomodoroFlags     = 0;
 static uint32_t pktPomodoroRemSec    = 0;
 static uint8_t  pktPomodoroPhase     = 0;
@@ -179,8 +196,6 @@ static uint8_t  pktPomodoroSession   = 0;
 static int8_t   pktPomodoroOffsetX   = 0;
 static int8_t   pktPomodoroOffsetY   = 0;
 static uint16_t pktPomodoroColor     = 0xFFE0;
-
-// Pomodoro (v1.9)
 static uint8_t  pktPomodoroLayout    = 0;
 static uint8_t  pktPomodoroSessTotal = 4;
 static uint16_t pktPomodoroTotalSec  = 1500;
@@ -215,117 +230,64 @@ static uint16_t crc16(const uint8_t* data, size_t len) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// renderFrame — blit one RGB565 frame from PSRAM to the matrix
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void renderFrame(int bufIdx, int frameIdx) {
-    const uint8_t* src = pktBuf[bufIdx]
-                       + HEADER_SIZE
-                       + (uint32_t)frameIdx * FRAME_BYTES;
-    for (int y = 0; y < REAL_HEIGHT; y++) {
-        for (int x = 0; x < PANEL_WIDTH; x++) {
-            const int      i     = y * PANEL_WIDTH + x;
-            const uint16_t color = ((uint16_t)src[i * 2] << 8) | src[i * 2 + 1];
-            matrix->drawPixel(x, y, color);
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// overdrawProgressBar — 2-px Spotify progress bar, position from millis()
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
-                                 uint8_t barX, uint8_t barY, uint8_t barW,
-                                 uint16_t barColor) {
-    if (trackDurMs == 0 || barW == 0) return;
-    float p = (float)songPosMs / (float)trackDurMs;
-    if (p < 0.0f) p = 0.0f;
-    if (p > 1.0f) p = 1.0f;
-    const int      filled  = (int)(barW * p + 0.5f);
-    const uint16_t bgColor = 0x3186;
-    for (int row = barY; row <= barY + 1; row++) {
-        for (int x = 0; x < (int)barW; x++) {
-            matrix->drawPixel(barX + x, row, x < filled ? barColor : bgColor);
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// parseHeader — v2.0 — 80-byte header (clock v1.6 extension at [68..79])
+// parseHeader — extract all fields from the 80-byte header
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void parseHeader() {
-    const uint8_t* h = pktBuf[pendingBuf];
+    uint8_t* buf = pktBuf[pendingBuf];
 
-    pktFlags        =  h[3];
-    pktFrameCount   = ((uint16_t)h[4]  << 8) | h[5];
-    pktWidth        = ((uint16_t)h[6]  << 8) | h[7];
-    pktHeight       = ((uint16_t)h[8]  << 8) | h[9];
-    pktDurMs        = ((uint16_t)h[10] << 8) | h[11];
-    pktPayloadBytes = ((uint32_t)h[12] << 24)
-                    | ((uint32_t)h[13] << 16)
-                    | ((uint32_t)h[14] <<  8)
-                    |            h[15];
-    pktStartPosMs   = ((uint32_t)h[16] << 24)
-                    | ((uint32_t)h[17] << 16)
-                    | ((uint32_t)h[18] <<  8)
-                    |            h[19];
-    pktTrackDurMs   = ((uint32_t)h[20] << 24)
-                    | ((uint32_t)h[21] << 16)
-                    | ((uint32_t)h[22] <<  8)
-                    |            h[23];
-    pktBarX         = h[24];
-    pktBarY         = h[25];
-    pktBarW         = h[26];
-    pktBarColor     = ((uint16_t)h[27] << 8) | h[28];
+    pktFlags        = buf[3];
+    pktFrameCount   = ((uint16_t)buf[4]  << 8) | buf[5];
+    pktWidth        = ((uint16_t)buf[6]  << 8) | buf[7];
+    pktHeight       = ((uint16_t)buf[8]  << 8) | buf[9];
+    pktDurMs        = ((uint16_t)buf[10] << 8) | buf[11];
+    pktPayloadBytes = ((uint32_t)buf[12] << 24) | ((uint32_t)buf[13] << 16)
+                    | ((uint32_t)buf[14] << 8)  |  (uint32_t)buf[15];
+    pktStartPosMs   = ((uint32_t)buf[16] << 24) | ((uint32_t)buf[17] << 16)
+                    | ((uint32_t)buf[18] << 8)  |  (uint32_t)buf[19];
+    pktTrackDurMs   = ((uint32_t)buf[20] << 24) | ((uint32_t)buf[21] << 16)
+                    | ((uint32_t)buf[22] << 8)  |  (uint32_t)buf[23];
+    pktBarX         = buf[24];
+    pktBarY         = buf[25];
+    pktBarW         = buf[26];
+    pktBarColor     = ((uint16_t)buf[27] << 8) | buf[28];
 
-    // ── Clock [29..51] ────────────────────────────────────────────────────
-    pktClockFlags    = h[29];
-    pktClockEpochSec = ((uint32_t)h[30] << 24)
-                     | ((uint32_t)h[31] << 16)
-                     | ((uint32_t)h[32] <<  8)
-                     |            h[33];
-    pktClockTzMin    = (int16_t)(((uint16_t)h[34] << 8) | h[35]);
-    pktClockFontId   = h[36];
-    pktClockOffsetX  = (int8_t)h[37];
-    pktClockOffsetY  = (int8_t)h[38];
-    // h[39] reserved
-    pktHoursColor    = ((uint16_t)h[40] << 8) | h[41];
-    pktMinutesColor  = ((uint16_t)h[42] << 8) | h[43];
-    pktSecondsColor  = ((uint16_t)h[44] << 8) | h[45];
-    pktColonColor    = ((uint16_t)h[46] << 8) | h[47];
-    pktDateColor     = ((uint16_t)h[48] << 8) | h[49];
-    pktAmpmColor     = ((uint16_t)h[50] << 8) | h[51];
+    pktClockFlags   = buf[29];
+    pktClockEpochSec= ((uint32_t)buf[30] << 24) | ((uint32_t)buf[31] << 16)
+                    | ((uint32_t)buf[32] << 8)  |  (uint32_t)buf[33];
+    pktClockTzMin   = (int16_t)(((uint16_t)buf[34] << 8) | buf[35]);
+    pktClockFontId  = buf[36];
+    pktClockOffsetX = (int8_t)buf[37];
+    pktClockOffsetY = (int8_t)buf[38];
+    pktHoursColor   = ((uint16_t)buf[39] << 8) | buf[40];
+    pktMinutesColor = ((uint16_t)buf[41] << 8) | buf[42];
+    pktSecondsColor = ((uint16_t)buf[43] << 8) | buf[44];
+    pktColonColor   = ((uint16_t)buf[45] << 8) | buf[46];
+    pktDateColor    = ((uint16_t)buf[47] << 8) | buf[48];
+    pktAmpmColor    = ((uint16_t)buf[49] << 8) | buf[50];
 
-    // ── Pomodoro [52..67] ─────────────────────────────────────────────────
-    pktPomodoroFlags   = h[52];
-    pktPomodoroRemSec  = ((uint32_t)h[53] << 24)
-                       | ((uint32_t)h[54] << 16)
-                       | ((uint32_t)h[55] <<  8)
-                       |            h[56];
-    pktPomodoroPhase   = h[57];
-    pktPomodoroSession = h[58];
-    pktPomodoroOffsetX = (int8_t)h[59];
-    pktPomodoroOffsetY = (int8_t)h[60];
-    pktPomodoroColor   = ((uint16_t)h[61] << 8) | h[62];
-    pktPomodoroLayout    = h[63];
-    pktPomodoroSessTotal = h[64];
-    pktPomodoroTotalSec  = ((uint16_t)h[65] << 8) | h[66];
-    // h[67] reserved
+    pktClockLayoutStyle = buf[51];
+    pktClockAnalogFlags = buf[52];
+    pktClockTz2Min      = (int16_t)(((uint16_t)buf[53] << 8) | buf[54]);
+    memcpy(pktClockLabel1, &buf[55], 4); pktClockLabel1[4] = '\0';
+    memcpy(pktClockLabel2, &buf[59], 4); pktClockLabel2[4] = '\0';
 
-    // ── Clock v1.6 extension [68..79] ─────────────────────────────────────
-    pktClockLayoutStyle = h[68];
-    pktClockAnalogFlags = h[69];
-    pktClockTz2Min      = (int16_t)(((uint16_t)h[70] << 8) | h[71]);
-    for (int i = 0; i < 4; i++) pktClockLabel1[i] = (char)h[72 + i];
-    pktClockLabel1[4] = '\0';
-    for (int i = 0; i < 4; i++) pktClockLabel2[i] = (char)h[76 + i];
-    pktClockLabel2[4] = '\0';
+    pktPomodoroFlags     = buf[63];
+    pktPomodoroRemSec    = ((uint32_t)buf[64] << 24) | ((uint32_t)buf[65] << 16)
+                         | ((uint32_t)buf[66] << 8)  |  (uint32_t)buf[67];
+    pktPomodoroPhase     = buf[68];
+    pktPomodoroSession   = buf[69];
+    pktPomodoroOffsetX   = (int8_t)buf[70];
+    pktPomodoroOffsetY   = (int8_t)buf[71];
+    pktPomodoroColor     = ((uint16_t)buf[72] << 8) | buf[73];
+    pktPomodoroLayout    = buf[74];
+    pktPomodoroSessTotal = buf[75];
+    pktPomodoroTotalSec  = ((uint16_t)buf[76] << 8) | buf[77];
+    // buf[78..79] reserved
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processPacket — validate CRC, then commit or preload next buffer
+// processPacket — validate CRC, commit or preload, send ACK/NAK
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void processPacket() {
@@ -339,8 +301,9 @@ static void processPacket() {
     if (computed != received) {
         DLOGF("[NAK] CRC mismatch: computed=0x%04X received=0x%04X\n",
               computed, received);
+        Serial.flush();          // drain debug text before response byte
         Serial.write(RESP_NAK);
-        Serial.flush();
+        Serial.flush();          // flush response byte alone
         return;
     }
 
@@ -360,8 +323,9 @@ static void processPacket() {
         xSemaphoreGive(nextMutex);
 
         DLOGF("[ACK-NEXT] %d frames preloaded\n", pktFrameCount);
+        Serial.flush();          // drain debug text before response byte
         Serial.write(RESP_ACK);
-        Serial.flush();
+        Serial.flush();          // flush response byte alone
         return;
     }
 
@@ -379,10 +343,10 @@ static void processPacket() {
     activeBarW          = pktBarW;
     activeBarColor      = pktBarColor;
 
-    // Clock (v1.5)
     activeClockFlags    = pktClockFlags;
     activeClockEpochSec = pktClockEpochSec;
     activeClockTzMin    = pktClockTzMin;
+    activeClockTz2Min   = pktClockTz2Min;
     activeClockFontId   = pktClockFontId;
     activeClockOffsetX  = pktClockOffsetX;
     activeClockOffsetY  = pktClockOffsetY;
@@ -392,140 +356,179 @@ static void processPacket() {
     activeColonColor    = pktColonColor;
     activeDateColor     = pktDateColor;
     activeAmpmColor     = pktAmpmColor;
+    activeClockLayout   = pktClockLayoutStyle;
+    activeAnalogFlags   = pktClockAnalogFlags;
+    memcpy((void*)activeLabel1, pktClockLabel1, 5);
+    memcpy((void*)activeLabel2, pktClockLabel2, 5);
 
-    // Clock (v1.6 extension)
-    activeClockLayoutStyle = pktClockLayoutStyle;
-    activeClockAnalogFlags = pktClockAnalogFlags;
-    activeClockTz2Min      = pktClockTz2Min;
-    for (int i = 0; i < 5; i++) {
-        activeClockLabel1[i] = pktClockLabel1[i];
-        activeClockLabel2[i] = pktClockLabel2[i];
-    }
-
-    // Pomodoro (v1.8)
-    activePomodoroFlags   = pktPomodoroFlags;
-    activePomodoroRemSec  = pktPomodoroRemSec;
-    activePomodoroPhase   = pktPomodoroPhase;
-    activePomodoroSession = pktPomodoroSession;
-    activePomodoroOffsetX = pktPomodoroOffsetX;
-    activePomodoroOffsetY = pktPomodoroOffsetY;
-    activePomodoroColor   = pktPomodoroColor;
-
-    // Pomodoro (v1.9)
+    activePomodoroFlags     = pktPomodoroFlags;
+    activePomodoroRemSec    = pktPomodoroRemSec;
+    activePomodoroPhase     = pktPomodoroPhase;
+    activePomodoroSession   = pktPomodoroSession;
+    activePomodoroOffsetX   = pktPomodoroOffsetX;
+    activePomodoroOffsetY   = pktPomodoroOffsetY;
+    activePomodoroColor     = pktPomodoroColor;
     activePomodoroLayout    = pktPomodoroLayout;
     activePomodoroSessTotal = pktPomodoroSessTotal;
     activePomodoroTotalSec  = pktPomodoroTotalSec;
 
+    pendingBuf ^= 1; // flip double-buffer slot for next receive
+
     xSemaphoreGive(swapMutex);
 
-    pendingBuf = 1 - pendingBuf;
+    DLOGF("[ACK] flags=0x%02X frames=%d dur=%dms clock=%s font=%d layout=%d pomo=%s\n",
+          pktFlags, pktFrameCount, pktDurMs,
+          (pktClockFlags & CLK_FLAG_PRESENT) ? "yes" : "no",
+          pktClockFontId, pktClockLayoutStyle,
+          (pktPomodoroFlags & POMO_FLAG_PRESENT) ? "yes" : "no");
 
-    Serial.printf("[ACK] %d frames @ %d ms/frame  clock=%s font=%d layout=%d  "
-                  "pomo=%s layout=%d remSec=%lu totalSec=%u\n",
-                  pktFrameCount, pktDurMs,
-                  (pktClockFlags    & CLK_FLAG_PRESENT) ? "yes" : "no",
-                  pktClockFontId,
-                  pktClockLayoutStyle,
-                  (pktPomodoroFlags & POMO_FLAG_PRESENT) ? "yes" : "no",
-                  pktPomodoroLayout,
-                  (unsigned long)pktPomodoroRemSec,
-                  pktPomodoroTotalSec);
+    Serial.flush();          // drain debug text before response byte
     Serial.write(RESP_ACK);
-    Serial.flush();
+    Serial.flush();          // flush response byte alone
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // processSerial — non-blocking receive state machine, Core 1
+//
+// FIX 2: Serial.readBytes() return value is now used for rxIdx, not toRead.
+// FIX 3: Outer while loop drains all available serial data before returning,
+//        so no bytes are left in the ring buffer to be dropped if inputTask
+//        preempts loop() during the next vTaskDelay tick.
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void processSerial() {
-    uint8_t* buf = pktBuf[pendingBuf];
+    // FIX 3: keep draining as long as there is data and work to do.
+    // This prevents the 8 KB RX ring buffer from overflowing when a large
+    // packet arrives faster than loop() can call processSerial() at 1 kHz.
+    while (Serial.available() || rxState != RX_IDLE) {
 
-    // ── Scan for "FRM" magic ──────────────────────────────────────────────
-    while (rxState == RX_IDLE && Serial.available()) {
-        const uint8_t b = (uint8_t)Serial.read();
-        syncBuf[0] = syncBuf[1]; syncBuf[1] = syncBuf[2]; syncBuf[2] = b;
-        if (syncBuf[0] == FRM_MAGIC_0 &&
-            syncBuf[1] == FRM_MAGIC_1 &&
-            syncBuf[2] == FRM_MAGIC_2) {
-            buf[0] = FRM_MAGIC_0;
-            buf[1] = FRM_MAGIC_1;
-            buf[2] = FRM_MAGIC_2;
-            rxIdx   = 3;
-            rxState = RX_HEADER;
-            memset(syncBuf, 0, sizeof(syncBuf));
-            DLOGLN("[RX]  Magic found — reading header...");
-        }
-    }
+        uint8_t* buf = pktBuf[pendingBuf];
 
-    // ── Header ────────────────────────────────────────────────────────────
-    if (rxState == RX_HEADER && Serial.available()) {
-        const size_t needed = HEADER_SIZE - rxIdx;
-        const size_t avail  = (size_t)Serial.available();
-        const size_t toRead = (needed < avail) ? needed : avail;
-        Serial.readBytes((char*)buf + rxIdx, toRead);
-        rxIdx += (uint32_t)toRead;
-
-        if (rxIdx == HEADER_SIZE) {
-            parseHeader();
-            const uint32_t expectedPayload = (uint32_t)pktFrameCount * FRAME_BYTES;
-            const bool ok = (pktWidth        == PANEL_WIDTH)
-                         && (pktHeight       == REAL_HEIGHT)
-                         && (pktFrameCount   >  0)
-                         && (pktFrameCount   <= MAX_FRAMES)
-                         && (pktPayloadBytes == expectedPayload)
-                         && (HEADER_SIZE + pktPayloadBytes + CRC_SIZE <= MAX_PACKET)
-                         && (pktFlags == FRM_VERSION || pktFlags == FRM_NEXT);
-            if (!ok) {
-                DLOGF("[ERR] Header invalid — w=%d h=%d fc=%d flags=0x%02X\n",
-                      pktWidth, pktHeight, pktFrameCount, pktFlags);
-                Serial.write(RESP_ERR);
-                Serial.flush();
-                rxState = RX_IDLE;
-                rxIdx   = 0;
-            } else {
-                rxState = RX_PAYLOAD;
-                DLOGF("[RX]  Header OK — %d frames %lu B %d ms/frame\n",
-                      pktFrameCount, (unsigned long)pktPayloadBytes, pktDurMs);
+        // ── Scan for "FRM" magic ──────────────────────────────────────────
+        while (rxState == RX_IDLE && Serial.available()) {
+            const uint8_t b = (uint8_t)Serial.read();
+            syncBuf[0] = syncBuf[1]; syncBuf[1] = syncBuf[2]; syncBuf[2] = b;
+            if (syncBuf[0] == FRM_MAGIC_0 &&
+                syncBuf[1] == FRM_MAGIC_1 &&
+                syncBuf[2] == FRM_MAGIC_2) {
+                buf[0] = FRM_MAGIC_0;
+                buf[1] = FRM_MAGIC_1;
+                buf[2] = FRM_MAGIC_2;
+                rxIdx   = 3;
+                rxState = RX_HEADER;
+                memset(syncBuf, 0, sizeof(syncBuf));
+                DLOGLN("[RX]  Magic found — reading header...");
             }
         }
-    }
 
-    // ── Payload ───────────────────────────────────────────────────────────
-    if (rxState == RX_PAYLOAD && Serial.available()) {
-        const uint32_t payloadEnd = HEADER_SIZE + pktPayloadBytes;
-        const uint32_t needed     = payloadEnd - rxIdx;
-        const size_t   avail      = (size_t)Serial.available();
-        const size_t   toRead     = (needed < (uint32_t)avail)
-                                    ? (size_t)needed : (size_t)avail;
-        Serial.readBytes((char*)buf + rxIdx, toRead);
-        rxIdx += (uint32_t)toRead;
-        if (rxIdx == payloadEnd) rxState = RX_CRC_H;
-    }
+        // ── Header ────────────────────────────────────────────────────────
+        if (rxState == RX_HEADER && Serial.available()) {
+            const size_t needed = HEADER_SIZE - rxIdx;
+            const size_t avail  = (size_t)Serial.available();
+            const size_t toRead = (needed < avail) ? needed : avail;
+            // FIX 2: use return value, not toRead, in case of early timeout
+            const size_t got    = Serial.readBytes((char*)buf + rxIdx, toRead);
+            rxIdx += (uint32_t)got;
 
-    // ── CRC ───────────────────────────────────────────────────────────────
-    if (rxState == RX_CRC_H && Serial.available()) {
-        buf[rxIdx++] = (uint8_t)Serial.read();
-        rxState = RX_CRC_L;
-    }
+            if (rxIdx == HEADER_SIZE) {
+                parseHeader();
+                const uint32_t expectedPayload =
+                    (uint32_t)pktFrameCount * FRAME_BYTES;
+                const bool ok =
+                    (pktWidth        == PANEL_WIDTH)
+                 && (pktHeight       == REAL_HEIGHT)
+                 && (pktFrameCount   >  0)
+                 && (pktFrameCount   <= MAX_FRAMES)
+                 && (pktPayloadBytes == expectedPayload)
+                 && (HEADER_SIZE + pktPayloadBytes + CRC_SIZE <= MAX_PACKET)
+                 && (pktFlags == FRM_VERSION || pktFlags == FRM_NEXT);
 
-    if (rxState == RX_CRC_L && Serial.available()) {
-        buf[rxIdx++] = (uint8_t)Serial.read();
-        processPacket();
-        rxState = RX_IDLE;
-        rxIdx   = 0;
+                if (!ok) {
+                    DLOGF("[ERR] Header invalid — w=%d h=%d fc=%d flags=0x%02X\n",
+                          pktWidth, pktHeight, pktFrameCount, pktFlags);
+                    Serial.flush();          // drain debug text before response byte
+                    Serial.write(RESP_ERR);
+                    Serial.flush();          // flush response byte alone
+                    rxState = RX_IDLE;
+                    rxIdx   = 0;
+                    break; // exit drain loop — wait for next valid packet
+                } else {
+                    rxState = RX_PAYLOAD;
+                    DLOGF("[RX]  Header OK — %d frames %lu B %d ms/frame\n",
+                          pktFrameCount, (unsigned long)pktPayloadBytes, pktDurMs);
+                }
+            }
+        }
+
+        // ── Payload ───────────────────────────────────────────────────────
+        if (rxState == RX_PAYLOAD && Serial.available()) {
+            const uint32_t payloadEnd = HEADER_SIZE + pktPayloadBytes;
+            const uint32_t needed     = payloadEnd - rxIdx;
+            const size_t   avail      = (size_t)Serial.available();
+            const size_t   toRead     = (needed < (uint32_t)avail)
+                                        ? (size_t)needed : (size_t)avail;
+            // FIX 2: capture actual bytes read — readBytes() may return early
+            // if the stream timeout fires before all requested bytes arrive.
+            const size_t got = Serial.readBytes((char*)buf + rxIdx, toRead);
+            rxIdx += (uint32_t)got;
+            if (rxIdx == payloadEnd) rxState = RX_CRC_H;
+        }
+
+        // ── CRC ───────────────────────────────────────────────────────────
+        if (rxState == RX_CRC_H && Serial.available()) {
+            buf[rxIdx++] = (uint8_t)Serial.read();
+            rxState = RX_CRC_L;
+        }
+
+        if (rxState == RX_CRC_L && Serial.available()) {
+            buf[rxIdx++] = (uint8_t)Serial.read();
+            processPacket();
+            rxState = RX_IDLE;
+            rxIdx   = 0;
+            break; // packet complete — exit drain loop, yield to other tasks
+        }
+
+        // If no progress was made (waiting for more bytes), exit the loop
+        // so loop() can call vTaskDelay and let the scheduler run.
+        if (!Serial.available()) break;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// displayTask — Core 0
-//
-// Render order every frame:
-//   1. renderFrame()           blit baked RGB565 pixels from PSRAM
-//   2. overdrawProgressBar()   live Spotify bar from millis()
-//   3. overdrawClock()         live digits from epoch + millis()
-//   4. overdrawPomodoro()      live countdown from millis()
-//   5. matrix->flipDMABuffer() commit composited frame to display
+// renderFrame / overdrawProgressBar — Core 0 helpers (unchanged from v4.0)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void renderFrame(int bufIdx, int frameIdx) {
+    const uint8_t* src = pktBuf[bufIdx]
+                       + HEADER_SIZE
+                       + (uint32_t)frameIdx * FRAME_BYTES;
+    for (int y = 0; y < REAL_HEIGHT; y++) {
+        for (int x = 0; x < PANEL_WIDTH; x++) {
+            const int      i     = y * PANEL_WIDTH + x;
+            const uint16_t color = ((uint16_t)src[i * 2] << 8) | src[i * 2 + 1];
+            matrix->drawPixel(x, y, color); // drawPixel(x, y, rgb565) — Adafruit_GFX API
+        }
+    }
+}
+
+static void overdrawProgressBar(uint32_t songPosMs, uint32_t trackDurMs,
+                                uint8_t barX, uint8_t barY, uint8_t barW,
+                                uint16_t barColor) {
+    if (trackDurMs == 0 || barW == 0) return;
+    float p = (float)songPosMs / (float)trackDurMs;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    const int      filled  = (int)(barW * p + 0.5f);
+    const uint16_t bgColor = 0x3186; // #333333 in RGB565
+    for (int row = barY; row <= barY + 1; row++) {
+        for (int x = 0; x < (int)barW; x++) {
+            matrix->drawPixel(barX + x, row, x < filled ? barColor : bgColor);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// displayTask — Core 0 (unchanged from v4.0)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void displayTask(void* /*param*/) {
@@ -533,153 +536,86 @@ static void displayTask(void* /*param*/) {
     uint32_t taskStart    = millis();
 
     while (true) {
-        // ── Snapshot active state (fast, under mutex) ──────────────────────
         xSemaphoreTake(swapMutex, portMAX_DELAY);
 
-        const int      buf          = activeBuf;
-        const int      count        = activeFrameCount;
-        const uint16_t dur          = activeFrameDurMs;
-        const uint32_t startPos     = activeStartPosMs;
-        const uint32_t trackDur     = activeTrackDurMs;
-        const uint32_t committed    = commitTimeMs;
-        const uint8_t  barX         = activeBarX;
-        const uint8_t  barY         = activeBarY;
-        const uint8_t  barW         = activeBarW;
-        const uint16_t barColor     = activeBarColor;
-        const uint8_t  clockFlags   = activeClockFlags;
-        const uint32_t epochSec     = activeClockEpochSec;
-        const int16_t  tzMin        = activeClockTzMin;
-        const int16_t  tzMin2       = activeClockTz2Min;
-        const uint8_t  clockFont    = activeClockFontId;
-        const int8_t   clockOffX    = activeClockOffsetX;
-        const int8_t   clockOffY    = activeClockOffsetY;
-        const uint16_t hoursCol     = activeHoursColor;
-        const uint16_t minutesCol   = activeMinutesColor;
-        const uint16_t secondsCol   = activeSecondsColor;
-        const uint16_t colonCol     = activeColonColor;
-        const uint16_t dateCol      = activeDateColor;
-        const uint16_t ampmCol      = activeAmpmColor;
-        const uint8_t  clockLayout  = activeClockLayoutStyle;
-        const uint8_t  analogFlags  = activeClockAnalogFlags;
-        char label1[5], label2[5];
-        memcpy(label1, activeClockLabel1, 5);
-        memcpy(label2, activeClockLabel2, 5);
-        const uint8_t  pomoFlags    = activePomodoroFlags;
-        const uint32_t pomoRemSec   = activePomodoroRemSec;
-        const uint8_t  pomoPhase    = activePomodoroPhase;
-        const uint8_t  pomoLayout   = activePomodoroLayout;
-        const uint8_t  pomoSession  = activePomodoroSession;
-        const uint8_t  pomoSessTotal= activePomodoroSessTotal;
-        const int8_t   pomoOffX     = activePomodoroOffsetX;
-        const int8_t   pomoOffY     = activePomodoroOffsetY;
-        const uint16_t pomoColor    = activePomodoroColor;
-        const uint32_t pomoTotalSec = activePomodoroTotalSec;
+        const int      buf        = activeBuf;
+        const int      count      = activeFrameCount;
+        const uint16_t dur        = activeFrameDurMs;
+        const uint32_t startPos   = activeStartPosMs;
+        const uint32_t trackDur   = activeTrackDurMs;
+        const uint32_t committed  = commitTimeMs;
+        const uint8_t  barX       = activeBarX;
+        const uint8_t  barY       = activeBarY;
+        const uint8_t  barW       = activeBarW;
+        const uint16_t barColor   = activeBarColor;
+        const uint8_t  clockFlags = activeClockFlags;
+        const uint32_t epochSec   = activeClockEpochSec;
+        const int16_t  tzMin      = activeClockTzMin;
+        const int16_t  tzMin2     = activeClockTz2Min;
+        const uint8_t  clockFont  = activeClockFontId;
+        const int8_t   clockOffX  = activeClockOffsetX;
+        const int8_t   clockOffY  = activeClockOffsetY;
+        const uint16_t hoursCol   = activeHoursColor;
+        const uint16_t minutesCol = activeMinutesColor;
+        const uint16_t secondsCol = activeSecondsColor;
+        const uint16_t colonCol   = activeColonColor;
+        const uint16_t dateCol    = activeDateColor;
+        const uint16_t ampmCol    = activeAmpmColor;
+        const uint8_t  clockLayout= activeClockLayout;
+        const uint8_t  analogFlags= activeAnalogFlags;
+        char label1[5]; memcpy(label1, (const void*)activeLabel1, 5);
+        char label2[5]; memcpy(label2, (const void*)activeLabel2, 5);
+        const uint8_t  pomoFlags  = activePomodoroFlags;
+        const uint32_t pomoRemSec = activePomodoroRemSec;
+        const uint8_t  pomoPhase  = activePomodoroPhase;
+        const uint8_t  pomoLayout = activePomodoroLayout;
+        const uint8_t  pomoSession= activePomodoroSession;
+        const uint8_t  pomoSessTotal = activePomodoroSessTotal;
+        const uint16_t pomoTotalSec  = activePomodoroTotalSec;
+        const int8_t   pomoOffX   = activePomodoroOffsetX;
+        const int8_t   pomoOffY   = activePomodoroOffsetY;
+        const uint16_t pomoColor  = activePomodoroColor;
 
         xSemaphoreGive(swapMutex);
 
-        // ── Nothing to show — idle splash ─────────────────────────────────
+        const uint32_t t0 = millis();
+
         if (count == 0) {
             showWaitingScreen(millis() - taskStart);
             matrix->flipDMABuffer();
-            vTaskDelay(pdMS_TO_TICKS(33));
+            vTaskDelay(pdMS_TO_TICKS(33)); // ~30 fps while idle
             continue;
         }
 
-        // ── Spotify next-song swap ────────────────────────────────────────
-        // If a next-song buffer is ready and playback has reached the end
-        // of the current track, atomically swap it in.
-        if (nextBufReady && trackDur > 0) {
-            const uint32_t elapsed  = millis() - committed;
-            const uint32_t livePos  = startPos + elapsed;
-            if (livePos >= trackDur) {
-                xSemaphoreTake(nextMutex, portMAX_DELAY);
-                if (nextBufReady) {
-                    // Copy next-buffer state into active slot
-                    const int nextSlot = 1 - activeBuf;
-                    memcpy(pktBuf[nextSlot], nextBuf,
-                           HEADER_SIZE + (uint32_t)nextFrameCount * FRAME_BYTES + CRC_SIZE);
-
-                    xSemaphoreTake(swapMutex, portMAX_DELAY);
-                    activeBuf        = nextSlot;
-                    activeFrameCount = nextFrameCount;
-                    activeFrameDurMs = nextFrameDurMs;
-                    activeStartPosMs = 0;
-                    activeTrackDurMs = nextTrackDurMs;
-                    commitTimeMs     = millis();
-                    activeBarX       = nextBarX;
-                    activeBarY       = nextBarY;
-                    activeBarW       = nextBarW;
-                    activeBarColor   = nextBarColor;
-                    xSemaphoreGive(swapMutex);
-
-                    nextBufReady  = false;
-                    currentFrame  = 0;
-                }
-                xSemaphoreGive(nextMutex);
-                continue; // re-snapshot with new active state
-            }
-        }
-
-        // Clamp frame index for safety
         if (currentFrame >= count) currentFrame = 0;
 
-        const uint32_t t0 = millis();
-
-        // ── 1. Blit base frame ─────────────────────────────────────────────
         renderFrame(buf, currentFrame);
 
-        // ── 2. Spotify progress bar ────────────────────────────────────────
         if (barW > 0 && trackDur > 0) {
             const uint32_t livePos = startPos + (millis() - committed);
             overdrawProgressBar(livePos, trackDur, barX, barY, barW, barColor);
         }
 
-        // ── 3. Clock overdraw ─────────────────────────────────────────────
         if (clockFlags & CLK_FLAG_PRESENT) {
-            overdrawClock(
-                epochSec,
-                millis() - committed,
-                tzMin,
-                tzMin2,
-                clockFlags,
-                clockLayout,
-                analogFlags,
-                clockFont,
-                clockOffX,
-                clockOffY,
-                hoursCol,
-                minutesCol,
-                secondsCol,
-                colonCol,
-                dateCol,
-                ampmCol,
-                label1,
-                label2);
+            overdrawClock(epochSec, millis() - committed, tzMin, tzMin2,
+                          clockFlags, clockLayout, analogFlags, clockFont,
+                          clockOffX, clockOffY,
+                          hoursCol, minutesCol, secondsCol,
+                          colonCol, dateCol, ampmCol, label1, label2);
         }
 
-        // ── 4. Pomodoro countdown ─────────────────────────────────────────
         if (pomoFlags & POMO_FLAG_PRESENT) {
-            overdrawPomodoro(
-                pomoRemSec,
-                pomoTotalSec,
-                millis(),
-                pomoPhase,
-                pomoLayout,
-                pomoFlags,
-                pomoSession,
-                pomoSessTotal,
-                pomoOffX,
-                pomoOffY,
-                pomoColor);
+            overdrawPomodoro(pomoRemSec, pomoTotalSec, millis(),
+                             pomoPhase, pomoLayout, pomoFlags,
+                             pomoSession, pomoSessTotal,
+                             pomoOffX, pomoOffY, pomoColor);
         }
 
-        // ── 5. Commit to display ──────────────────────────────────────────
         matrix->flipDMABuffer();
 
-        // ── Advance frame, respect per-frame duration ─────────────────────
-        const uint32_t elapsed  = millis() - t0;
+        const uint32_t elapsed   = millis() - t0;
         currentFrame = (currentFrame + 1) % count;
-        const int32_t remaining = (int32_t)dur - (int32_t)elapsed;
+        const int32_t remaining  = (int32_t)dur - (int32_t)elapsed;
         if (remaining > 1) vTaskDelay(pdMS_TO_TICKS(remaining));
     }
 }
@@ -690,26 +626,25 @@ static void displayTask(void* /*param*/) {
 
 void setup() {
     // ── 1. HID — MUST register before Serial.begin() ─────────────────────
-    // TinyUSB builds the composite device descriptor once, before the USB
-    // stack starts.  hidControllerBegin() calls USB.VID/PID/productName and
-    // hid.begin() which adds the HID interface alongside the CDC interface.
-    // Calling Serial.begin() after this is safe — it merely opens the CDC
-    // endpoint that TinyUSB already registered.
     hidControllerBegin();
 
     // ── 2. CDC serial — FRM packet bus ────────────────────────────────────
-    // Buffer sizing BEFORE begin(): default 256 B RX = ~2.8 ms at 921600.
-    // 8 KB gives ~89 ms headroom for the inputTask preemption window.
+    // FIX 1: Serial.setTxBufferSize() does not exist on the ESP32-S3 USBCDC
+    // class — the TinyUSB CDC TX FIFO is a compile-time constant. The runtime
+    // fix is to call Serial.flush() BEFORE every Serial.write(RESP_*) so the
+    // large DLOGF debug string is fully drained from the TinyUSB TX queue first.
+    // The ACK/NAK/ERR byte is then written into an empty buffer and flushed
+    // alone, guaranteeing it is transmitted in the very next USB packet.
+    // See processPacket() — every Serial.write() is now preceded by flush().
     Serial.setRxBufferSize(8192);
     Serial.begin(921600);
     delay(200);
 
-    BOOTLOGLN("\n\nFrameon Firmware v4.0 (HID edition)");
+    BOOTLOGLN("\n\nFrameon Firmware v4.1 (HID edition)");
     BOOTLOGLN("════════════════════════════════════════");
     BOOTLOGF("  USB:         CDC (FRM) + HID (controller)  VID=0x%04X PID=0x%04X\n",
              FRAMEON_USB_VID, FRAMEON_USB_PID);
     BOOTLOGF("  RX buffer:   %u B\n", 8192);
-    BOOTLOGF("  TX buffer:   %u B\n", 2048);
 
     // ── 3. PSRAM double-buffer ────────────────────────────────────────────
     for (int i = 0; i < 2; i++) {
@@ -761,8 +696,8 @@ void setup() {
     BOOTLOGLN("Matrix OK.");
 
     // ── 6. Physical input task (Core 1, priority 1) ───────────────────────
-    inputInit();       // calibrates joystick, attaches encoder ISR
-    inputTaskStart();  // spawns FreeRTOS task that sends HID reports
+    inputInit();
+    inputTaskStart();
 
     // ── 7. Display task (Core 0, priority 2) ─────────────────────────────
     xTaskCreatePinnedToCore(displayTask, "display", 8192, nullptr, 2, nullptr, 0);
@@ -779,17 +714,13 @@ void setup() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // loop — Core 1
-//
-// Drains the input queue for any firmware-local actions (currently only the
-// displayLocked toggle from encoder long-hold).
-// HID reports are sent directly from inputTask — this loop is now lightweight.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
+    // FIX 3 is inside processSerial() — it now drains the entire RX ring
+    // buffer in one call rather than processing one chunk per tick.
     processSerial();
 
-    // inputApplyEvent is a stub in the HID build; the queue is kept only for
-    // displayLocked signalling and future firmware-local actions.
     InputEventType evt;
     while (xQueueReceive(inputQueue, &evt, 0) == pdTRUE) {
         inputApplyEvent(evt, matrix);
