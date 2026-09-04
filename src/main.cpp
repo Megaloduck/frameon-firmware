@@ -75,7 +75,6 @@
 #include "waitingscreen.h"
 #include "inputhelper.h"
 #include "debug_log.h"
-#include "transport.h"
 
 MatrixPanel_I2S_DMA* matrix = nullptr;
 
@@ -302,7 +301,9 @@ static void processPacket() {
     if (computed != received) {
         DLOGF("[NAK] CRC mismatch: computed=0x%04X received=0x%04X\n",
               computed, received);
-        transportSendResponse(RESP_NAK);
+        Serial.flush();          // drain debug text before response byte
+        Serial.write(RESP_NAK);
+        Serial.flush();          // flush response byte alone
         return;
     }
 
@@ -322,7 +323,9 @@ static void processPacket() {
         xSemaphoreGive(nextMutex);
 
         DLOGF("[ACK-NEXT] %d frames preloaded\n", pktFrameCount);
-        transportSendResponse(RESP_ACK);
+        Serial.flush();          // drain debug text before response byte
+        Serial.write(RESP_ACK);
+        Serial.flush();          // flush response byte alone
         return;
     }
 
@@ -379,7 +382,9 @@ static void processPacket() {
           pktClockFontId, pktClockLayoutStyle,
           (pktPomodoroFlags & POMO_FLAG_PRESENT) ? "yes" : "no");
 
-    transportSendResponse(RESP_ACK);
+    Serial.flush();          // drain debug text before response byte
+    Serial.write(RESP_ACK);
+    Serial.flush();          // flush response byte alone
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,7 +446,9 @@ static void processSerial() {
                 if (!ok) {
                     DLOGF("[ERR] Header invalid — w=%d h=%d fc=%d flags=0x%02X\n",
                           pktWidth, pktHeight, pktFrameCount, pktFlags);
-                    transportSendResponse(RESP_ERR);
+                    Serial.flush();          // drain debug text before response byte
+                    Serial.write(RESP_ERR);
+                    Serial.flush();          // flush response byte alone
                     rxState = RX_IDLE;
                     rxIdx   = 0;
                     break; // exit drain loop — wait for next valid packet
@@ -695,9 +702,6 @@ void setup() {
     // ── 7. Display task (Core 0, priority 2) ─────────────────────────────
     xTaskCreatePinnedToCore(displayTask, "display", 8192, nullptr, 2, nullptr, 0);
 
-    // ── 8. Multi-transport system (USB + WiFi + BLE) ──────────────────────
-    transportInit();
-
     BOOTLOGLN("Ready.");
     BOOTLOGLN("────────────────────────────────────────");
     BOOTLOGF("  Protocol:   v1.9  (header %d B)\n",  HEADER_SIZE);
@@ -713,8 +717,9 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
-    // Process all available transports (USB Serial, TCP, BLE)
-    transportProcess();
+    // FIX 3 is inside processSerial() — it now drains the entire RX ring
+    // buffer in one call rather than processing one chunk per tick.
+    processSerial();
 
     InputEventType evt;
     while (xQueueReceive(inputQueue, &evt, 0) == pdTRUE) {
